@@ -236,8 +236,10 @@ class DownloadManager: ObservableObject {
         let key = "vid_\(videoId)"
         addItem(key, status: .downloading, message: "Fetching stream…")
 
-        // Get auth headers — if signed in, bypasses bot check entirely
+        // Get auth headers and PO token
         let authHeaders = await AuthManager.shared.authHeaders()
+        let poToken = (try? await POTokenManager.shared.getToken(
+            for: videoId, visitorData: "")) ?? ""
 
         let playerURL = URL(string:
             "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
@@ -251,21 +253,19 @@ class DownloadManager: ObservableObject {
         req.timeoutInterval = 30
         for (k, v) in authHeaders { req.setValue(v, forHTTPHeaderField: k) }
 
-        // TVHTML5_SIMPLY_EMBEDDED_PLAYER bypasses age/region restrictions
-        // while still working with auth cookies to avoid bot detection
+        var clientContext: [String: Any] = [
+            "clientName":    "WEB",
+            "clientVersion": "2.20231121.08.00",
+            "hl":            "en",
+            "gl":            "US",
+        ]
+        if !poToken.isEmpty {
+            clientContext["poToken"] = poToken
+        }
+
         req.httpBody = try JSONSerialization.data(withJSONObject: [
             "videoId": videoId,
-            "context": [
-                "client": [
-                    "clientName":    "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-                    "clientVersion": "2.0",
-                    "hl":            "en",
-                    "gl":            "US",
-                ],
-                "thirdParty": [
-                    "embedUrl": "https://www.youtube.com"
-                ]
-            ]
+            "context": ["client": clientContext]
         ])
 
         var data: Data
