@@ -236,8 +236,11 @@ class DownloadManager: ObservableObject {
         let key = "vid_\(videoId)"
         addItem(key, status: .downloading, message: "Fetching stream…")
 
-        // iOS client is more reliable than ANDROID for direct API calls
-        // It doesn't require an API key and returns pre-signed stream URLs
+        // Fetch visitorData first — required since late 2024 to bypass bot check
+        var visitorData = ""
+        if let vd = try? await fetchVisitorData() { visitorData = vd }
+
+        // iOS client is most reliable for direct API calls
         let playerURL = URL(string:
             "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
         var req = URLRequest(url: playerURL)
@@ -257,6 +260,7 @@ class DownloadManager: ObservableObject {
                     "userAgent":     "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
                     "hl":            "en",
                     "gl":            "US",
+                    "visitorData":   visitorData,
                 ]
             ]
         ])
@@ -344,6 +348,49 @@ class DownloadManager: ObservableObject {
         )
         LibraryManager.shared.add(track)
         updateItem(title, status: .done, message: "Saved ✓")
+    }
+
+    // MARK: - Visitor Data (required to bypass bot check since late 2024)
+
+    private func fetchVisitorData() async throws -> String {
+        var req = URLRequest(url: URL(string:
+            "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")!)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 10
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "context": [
+                "client": [
+                    "clientName": "WEB",
+                    "clientVersion": "2.20231121.08.00",
+                    "hl": "en", "gl": "US",
+                ]
+            ]
+        ])
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let json = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let vd = json["visitorData"] as? String else {
+            // Fall back to fetching from YouTube homepage
+            return try await fetchVisitorDataFromHomepage()
+        }
+        return vd
+    }
+
+    private func fetchVisitorDataFromHomepage() async throws -> String {
+        var req = URLRequest(url: URL(string: "https://www.youtube.com/")!)
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15",
+                     forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 10
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let html = String(data: data, encoding: .utf8),
+              let r = html.range(of: "\"visitorData\":\"([^\"]+)\"",
+                                  options: .regularExpression),
+              let vr = html[r].range(of: "\"([^\"]+)\"$",
+                                     options: .regularExpression) else {
+            return ""
+        }
+        let raw = String(html[r][vr])
+        return raw.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
     }
 
     // MARK: - Utilities
