@@ -1,0 +1,30 @@
+name: lubricantante
+
+options:
+  bundleIdPrefix: com.wireless
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  xcodeVersion: "15.4"
+  projectFileVersion: "Xcode 14"
+
+targets:
+  lubricantante:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: lubricantante
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.wireless.lubricantante
+        INFOPLIST_FILE: lubricantante/Resources/Info.plist
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_ALLOWED: "NO"
+        DEVELOPMENT_TEAM: ""
