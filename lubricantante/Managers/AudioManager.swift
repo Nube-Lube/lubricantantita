@@ -7,17 +7,18 @@ class AudioManager: ObservableObject {
     static let shared = AudioManager()
 
     @Published var currentTrack: Track?
-    @Published var isPlaying = false
+    @Published var isPlaying    = false
     @Published var currentTime: Double = 0
-    @Published var duration: Double = 1
-    @Published var volume: Float = 1.0
-    @Published var shuffle = false
-    @Published var repeatOne = false
+    @Published var duration:    Double = 1
+    @Published var volume:      Float  = 1.0
+    @Published var shuffle      = false
+    @Published var repeatOne    = false
 
-    var queue: [Track] = []
-    var history: [Track] = []
+    // @Published so every append/remove/removeAll triggers a SwiftUI redraw
+    @Published var queue:   [Track] = []
+    @Published var history: [Track] = []
 
-    private var player: AVPlayer?
+    private var player:       AVPlayer?
     private var timeObserver: Any?
 
     init() {
@@ -25,7 +26,8 @@ class AudioManager: ObservableObject {
         setupRemoteCommands()
     }
 
-    // ── Session ───────────────────────────────────────────────
+    // MARK: - Session
+
     private func setupSession() {
         do {
             try AVAudioSession.sharedInstance().setCategory(
@@ -36,11 +38,12 @@ class AudioManager: ObservableObject {
         }
     }
 
-    // ── Lock screen / Control Centre ──────────────────────────
+    // MARK: - Lock screen / Control Centre
+
     private func setupRemoteCommands() {
         let c = MPRemoteCommandCenter.shared()
-        c.playCommand.addTarget  { [weak self] _ in self?.play();     return .success }
-        c.pauseCommand.addTarget { [weak self] _ in self?.pause();    return .success }
+        c.playCommand.addTarget          { [weak self] _ in self?.play();     return .success }
+        c.pauseCommand.addTarget         { [weak self] _ in self?.pause();    return .success }
         c.nextTrackCommand.addTarget     { [weak self] _ in self?.next();     return .success }
         c.previousTrackCommand.addTarget { [weak self] _ in self?.previous(); return .success }
         c.changePlaybackPositionCommand.addTarget { [weak self] event in
@@ -62,7 +65,8 @@ class AudioManager: ObservableObject {
         ]
     }
 
-    // ── Playback ──────────────────────────────────────────────
+    // MARK: - Playback
+
     func playTrack(_ track: Track) {
         currentTrack = track
         currentTime  = 0
@@ -72,11 +76,12 @@ class AudioManager: ObservableObject {
         NotificationCenter.default.removeObserver(
             self, name: .AVPlayerItemDidPlayToEndTime, object: nil)
 
-        let url = LibraryManager.shared.audioURL(for: track)
-        player = AVPlayer(url: url)
+        let url    = LibraryManager.shared.audioURL(for: track)
+        player     = AVPlayer(url: url)
         player?.volume = volume
 
-        let interval = CMTime(seconds: 0.25, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        let interval = CMTime(seconds: 0.25,
+                              preferredTimescale: CMTimeScale(NSEC_PER_SEC))
         timeObserver = player?.addPeriodicTimeObserver(
             forInterval: interval, queue: .main
         ) { [weak self] time in
@@ -114,10 +119,11 @@ class AudioManager: ObservableObject {
 
     func setVolume(_ v: Float) { volume = v; player?.volume = v }
 
-    // ── Queue ──────────────────────────────────────────────────
+    // MARK: - Queue
+
     func next() {
         guard !queue.isEmpty else { pause(); return }
-        var track: Track
+        let track: Track
         if shuffle {
             let i = Int.random(in: 0..<queue.count)
             track = queue.remove(at: i)

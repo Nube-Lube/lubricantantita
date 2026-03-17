@@ -11,7 +11,9 @@ struct QueueView: View {
                 Spacer()
                 if !audio.queue.isEmpty {
                     Button {
-                        audio.queue.removeAll()
+                        // Assign a fresh empty array rather than mutating in-place
+                        // — avoids a crash where ForEach re-evaluates stale indices
+                        audio.queue = []
                     } label: {
                         Text("Clear")
                             .font(.custom("Courier New", size: 11))
@@ -27,7 +29,8 @@ struct QueueView: View {
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 16)
-            .overlay(Rectangle().frame(height: 1).foregroundColor(Color.white.opacity(0.06)), alignment: .bottom)
+            .overlay(Rectangle().frame(height: 1)
+                .foregroundColor(Color.white.opacity(0.06)), alignment: .bottom)
 
             if audio.queue.isEmpty {
                 EmptyStateView(title: "Queue is empty",
@@ -35,7 +38,9 @@ struct QueueView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(Array(audio.queue.enumerated()), id: \.element.id) { i, track in
+                        // Use the track's stable UUID as the ForEach id, NOT the
+                        // enumerated index — so removals don't crash on stale indices
+                        ForEach(audio.queue) { track in
                             HStack(spacing: 12) {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(track.name)
@@ -48,12 +53,16 @@ struct QueueView: View {
                                 }
                                 Spacer()
                                 Button {
-                                    audio.queue.remove(at: i)
+                                    // Remove by identity, not index
+                                    audio.queue.removeAll { $0.id == track.id }
                                 } label: {
                                     Image(systemName: "xmark")
                                         .font(.system(size: 14))
                                         .foregroundColor(Color(hex: "6b6760"))
+                                        .padding(8)
+                                        .contentShape(Rectangle())
                                 }
+                                .buttonStyle(.borderless)
                             }
                             .padding(.horizontal, 18)
                             .padding(.vertical, 12)

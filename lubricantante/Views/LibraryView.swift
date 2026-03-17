@@ -13,8 +13,7 @@ struct LibraryView: View {
                     .font(.custom("Georgia", size: 26))
                 Spacer()
                 Button {
-                    let all = library.tracks
-                    audio.shuffleAll(all)
+                    audio.shuffleAll(library.tracks)
                 } label: {
                     Text("Shuffle All")
                         .font(.custom("Courier New", size: 11))
@@ -29,11 +28,12 @@ struct LibraryView: View {
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 16)
-            .overlay(Rectangle().frame(height: 1).foregroundColor(Color.white.opacity(0.06)), alignment: .bottom)
+            .overlay(Rectangle().frame(height: 1)
+                .foregroundColor(Color.white.opacity(0.06)), alignment: .bottom)
 
             if library.tracks.isEmpty {
                 EmptyStateView(title: "Library is empty",
-                               subtitle: "Download songs from the YouTube tab")
+                               subtitle: "Download songs from the Download tab")
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
@@ -57,17 +57,18 @@ struct LibraryView: View {
 }
 
 struct AlbumSection: View {
-    let album: String
-    let tracks: [Track]
+    let album:      String
+    let tracks:     [Track]
     let isExpanded: Bool
-    let onToggle: () -> Void
+    let onToggle:   () -> Void
 
     @ObservedObject var audio = AudioManager.shared
 
     var body: some View {
         VStack(spacing: 0) {
-            // Album row
-            Button(action: onToggle) {
+            // Album header row — tap the text area to expand, tap + to queue
+            HStack {
+                // Expand/collapse tap target
                 HStack {
                     Text(album)
                         .font(.custom("Georgia", size: 16))
@@ -79,28 +80,34 @@ struct AlbumSection: View {
                         .font(.custom("Courier New", size: 10))
                         .tracking(0.8)
                         .foregroundColor(Color(hex: "6b6760"))
-
-                    // Queue album button
-                    Button {
-                        audio.queue.append(contentsOf: tracks)
-                    } label: {
-                        Image(systemName: "plus.circle")
-                            .font(.system(size: 16))
-                            .foregroundColor(Color(hex: "6b6760"))
-                    }
-                    .padding(.leading, 8)
-
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color(hex: "6b6760"))
-                        .padding(.leading, 4)
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 13)
-            }
-            .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .onTapGesture { onToggle() }
 
-            // Tracks
+                // Add whole album to queue — separate from expand tap target
+                Button {
+                    audio.queue.append(contentsOf: tracks)
+                } label: {
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 16))
+                        .foregroundColor(Color(hex: "6b6760"))
+                        .padding(.leading, 12)
+                        .padding(.trailing, 4)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(hex: "6b6760"))
+                    .padding(.leading, 4)
+                    .onTapGesture { onToggle() }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 13)
+
+            // Track list
             if isExpanded {
                 ForEach(Array(tracks.enumerated()), id: \.element.id) { i, track in
                     TrackRow(track: track, index: i + 1)
@@ -142,19 +149,25 @@ struct TrackRow: View {
                 Image(systemName: "plus")
                     .font(.system(size: 14))
                     .foregroundColor(Color(hex: "6b6760"))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.borderless)
 
             // Delete
             Button {
                 library.delete(track)
-                if audio.currentTrack?.id == track.id {
-                    audio.next()
-                }
+                if audio.currentTrack?.id == track.id { audio.next() }
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 13))
                     .foregroundColor(Color(hex: "6b6760"))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.borderless)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 9)
@@ -168,7 +181,7 @@ struct TrackRow: View {
 }
 
 struct EmptyStateView: View {
-    let title: String
+    let title:    String
     let subtitle: String
 
     var body: some View {
