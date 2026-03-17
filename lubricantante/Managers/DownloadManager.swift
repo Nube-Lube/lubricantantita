@@ -319,19 +319,42 @@ class DownloadManager: ObservableObject {
 
         let formats = ((json["streamingData"] as? [String: Any])?["adaptiveFormats"] as? [[String: Any]]) ?? []
 
+        // Debug: log what format types are available
+        let allMimeTypes = formats.compactMap { $0["mimeType"] as? String }
+        let hasUrls = formats.filter { $0["url"] is String }.count
+        let hasCiphers = formats.filter { $0["signatureCipher"] is String || $0["cipher"] is String }.count
+
         let audioOnly = formats
             .filter { f in
                 guard let mime = f["mimeType"] as? String else { return false }
-                return mime.hasPrefix("audio") && f["url"] is String
+                return mime.hasPrefix("audio") && (f["url"] is String ||
+                       f["signatureCipher"] is String || f["cipher"] is String)
             }
             .sorted { a, b in
                 (a["bitrate"] as? Int ?? 0) > (b["bitrate"] as? Int ?? 0)
             }
 
-        guard let best   = audioOnly.first,
-              let urlStr = best["url"] as? String,
-              let audioURL = URL(string: urlStr) else {
-            throw ytErr("No audio stream found for: \(title)")
+        guard let best = audioOnly.first else {
+            let debugMsg = "No audio stream. Formats: \(allMimeTypes.prefix(5).joined(separator: ", ")). URLs: \(hasUrls), Ciphers: \(hasCiphers)"
+            throw ytErr(debugMsg)
+        }
+
+        // Handle both direct URL and signatureCipher formats
+        let rawUrl: String?
+        if let direct = best["url"] as? String {
+            rawUrl = direct
+        } else if let cipher = best["signatureCipher"] as? String ?? best["cipher"] as? String {
+            let parts = cipher.components(separatedBy: "&")
+            rawUrl = parts
+                .first(where: { $0.hasPrefix("url=") })?
+                .dropFirst(4)
+                .removingPercentEncoding
+        } else {
+            rawUrl = nil
+        }
+
+        guard let urlStr = rawUrl, let audioURL = URL(string: urlStr) else {
+            throw ytErr("Could not extract audio URL from stream data")
         }
 
         let mime = (best["mimeType"] as? String)?
