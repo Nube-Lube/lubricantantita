@@ -11,12 +11,7 @@ struct YouTubeView: View {
     @FocusState private var focused: Bool
 
     // Supported audio/video types for import
-    private let supportedTypes: [UTType] = [
-        .audio, .mp3, UTType("public.m4a-audio")!, .wav,
-        UTType("org.xiph.flac") ?? .audio,
-        UTType("public.ogg-vorbis-audio") ?? .audio,
-        .mpeg4Movie, .movie, .video
-    ].compactMap { $0 }
+    private let supportedTypes: [UTType] = [.audio, .mp3, .wav, .mpeg4Movie, .movie, .video]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -132,7 +127,7 @@ struct YouTubeView: View {
         .sheet(isPresented: $showLogin)    { YouTubeLoginView() }
         .sheet(isPresented: $showFilePicker) {
             DocumentPicker(album: albumName, supportedTypes: [
-                .audio, .mp3, .wav, .mpeg4Movie, .movie
+                .audio, .mp3, .wav, .mpeg4Movie, .movie, .video
             ])
         }
     }

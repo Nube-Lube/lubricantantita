@@ -36,7 +36,13 @@ class DownloadManager: NSObject, ObservableObject {
         let url: String; let mimeType: String; let title: String
     }
 
-    override init() { super.init(); setupWebView() }
+    override init() { super.init() }
+
+    // Called lazily on first download — UI is guaranteed ready by then
+    private func ensureWebView() {
+        guard webView == nil else { return }
+        setupWebView()
+    }
 
     // ── WebView setup ─────────────────────────────────────────────────────
     private func setupWebView() {
@@ -53,7 +59,7 @@ class DownloadManager: NSObject, ObservableObject {
         wv.navigationDelegate = self
         wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        DispatchQueue.main.async {
             UIApplication.shared.connectedScenes
                 .compactMap { $0 as? UIWindowScene }
                 .first?.windows.first?.addSubview(wv)
@@ -65,6 +71,7 @@ class DownloadManager: NSObject, ObservableObject {
     func start(urlString: String) {
         guard !isDownloading else { return }
         isDownloading = true; items.removeAll()
+        ensureWebView()
         Task {
             do {
                 if let listId = extractPlaylistId(from: urlString),
