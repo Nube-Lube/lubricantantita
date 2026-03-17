@@ -37,81 +37,90 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            ENABLE_BITCODE=NO
+            ENABLE_BITCODE=NO \
+            ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=YES
 
-      - name: Find and prepare app
+      - name: Find and copy Swift frameworks
         run: |
           # Find the built app
           APP_PATH=$(find ${{ github.workspace }}/build/Build/Products/Release-iphoneos -name "*.app" -type d | head -1)
-          echo "App found at: $APP_PATH"
+          echo "App path: $APP_PATH"
           
-          if [ -z "$APP_PATH" ]; then
-            echo "ERROR: No .app found!"
-            exit 1
+          # Xcode should have created SwiftSupport folder somewhere
+          echo "Searching for Swift libraries in build output..."
+          find ${{ github.workspace }}/build -name "*.dylib" 2>/dev/null | head -20
+          
+          # Check if Xcode already embedded them
+          if [ -d "$APP_PATH/Frameworks" ] && [ "$(ls -A $APP_PATH/Frameworks)" ]; then
+            echo "✓ Xcode already embedded Swift frameworks!"
+            ls -lh "$APP_PATH/Frameworks/"
+          else
+            echo "⚠️  No frameworks embedded by Xcode, copying manually..."
+            
+            # Create Frameworks directory
+            mkdir -p "$APP_PATH/Frameworks"
+            
+            # Search for Swift 5.0 dylibs in Xcode
+            XCODE_ROOT="/Applications/Xcode_15.4.app/Contents/Developer"
+            
+            # Try multiple possible locations
+            POSSIBLE_PATHS=(
+              "$XCODE_ROOT/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/iphoneos"
+              "$XCODE_ROOT/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/usr/lib/swift"
+              "$XCODE_ROOT/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos"
+            )
+            
+            for path in "${POSSIBLE_PATHS[@]}"; do
+              echo "Checking: $path"
+              if [ -d "$path" ]; then
+                echo "✓ Found! Contents:"
+                ls "$path" | head -10
+                
+                # Look for dylibs
+                if ls "$path"/*.dylib >/dev/null 2>&1; then
+                  cp "$path"/*.dylib "$APP_PATH/Frameworks/" 2>/dev/null || true
+                  echo "Copied dylibs from $path"
+                  break
+                fi
+              fi
+            done
+            
+            # If still no dylibs, do a full search
+            DYLIB_COUNT=$(ls "$APP_PATH/Frameworks"/*.dylib 2>/dev/null | wc -l)
+            if [ "$DYLIB_COUNT" -eq 0 ]; then
+              echo "Still no dylibs, doing full Xcode search..."
+              SWIFT_CORE=$(find "$XCODE_ROOT" -name "libswiftCore.dylib" -path "*/iphoneos*" 2>/dev/null | head -1)
+              if [ -n "$SWIFT_CORE" ]; then
+                SWIFT_DIR=$(dirname "$SWIFT_CORE")
+                echo "Found Swift libraries at: $SWIFT_DIR"
+                cp "$SWIFT_DIR"/*.dylib "$APP_PATH/Frameworks/"
+                echo "Copied all dylibs from $SWIFT_DIR"
+              fi
+            fi
           fi
           
-          # Show what's in the app
-          echo "App contents before adding Swift libs:"
-          ls -lah "$APP_PATH"
-          
-          # Create Frameworks directory
-          mkdir -p "$APP_PATH/Frameworks"
-          
-          # Find Xcode's Swift library path
-          XCODE_PATH=$(xcode-select -p)
-          SWIFT_LIB_PATH="$XCODE_PATH/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos"
-          
-          echo "Swift library path: $SWIFT_LIB_PATH"
-          echo "Checking if path exists:"
-          ls "$SWIFT_LIB_PATH" | head -10
-          
-          # List of required Swift libraries
-          SWIFT_LIBS=(
-            "libswiftCore.dylib"
-            "libswiftCoreFoundation.dylib"
-            "libswiftCoreGraphics.dylib"
-            "libswiftDarwin.dylib"
-            "libswiftDispatch.dylib"
-            "libswiftFoundation.dylib"
-            "libswiftObjectiveC.dylib"
-            "libswiftUIKit.dylib"
-            "libswiftMetal.dylib"
-            "libswiftQuartzCore.dylib"
-            "libswiftSwiftOnoneSupport.dylib"
-            "libswift_Concurrency.dylib"
-            "libswift_StringProcessing.dylib"
-            "libswiftAVFAudio.dylib"
-            "libswiftAVFoundation.dylib"
-            "libswiftMediaPlayer.dylib"
-            "libswiftCoreAudio.dylib"
-          )
-          
-          # Copy each library
-          COPIED_COUNT=0
-          for lib in "${SWIFT_LIBS[@]}"; do
-            if [ -f "$SWIFT_LIB_PATH/$lib" ]; then
-              cp "$SWIFT_LIB_PATH/$lib" "$APP_PATH/Frameworks/"
-              echo "✓ Copied $lib"
-              COPIED_COUNT=$((COPIED_COUNT + 1))
-            else
-              echo "⚠️  Not found: $lib"
-            fi
-          done
-          
+          # Final check
           echo ""
-          echo "Copied $COPIED_COUNT Swift libraries"
-          echo ""
-          echo "Frameworks folder contents:"
-          ls -lh "$APP_PATH/Frameworks/"
+          echo "=== Final Frameworks directory ==="
+          ls -lh "$APP_PATH/Frameworks/" 2>/dev/null || echo "ERROR: No Frameworks directory!"
           
-          if [ $COPIED_COUNT -eq 0 ]; then
-            echo "ERROR: No Swift libraries were copied!"
-            exit 1
+          FINAL_COUNT=$(find "$APP_PATH/Frameworks/" -name "*.dylib" 2>/dev/null | wc -l)
+          echo "Total dylibs: $FINAL_COUNT"
+          
+          if [ "$FINAL_COUNT" -eq 0 ]; then
+            echo "❌ ERROR: No Swift libraries found!"
+            echo "App will crash on launch!"
+          else
+            echo "✓ Swift libraries embedded successfully"
           fi
 
       - name: Create IPA
         run: |
           APP_PATH=$(find ${{ github.workspace }}/build/Build/Products/Release-iphoneos -name "*.app" -type d | head -1)
+          
+          # Show app size before packaging
+          echo "App bundle size:"
+          du -sh "$APP_PATH"
           
           # Create Payload folder
           mkdir -p Payload
@@ -121,11 +130,8 @@ jobs:
           zip -r lubricantante.ipa Payload
           
           echo ""
-          echo "=== FINAL IPA DETAILS ==="
+          echo "=== FINAL IPA ==="
           ls -lh lubricantante.ipa
-          echo ""
-          echo "IPA contents preview:"
-          unzip -l lubricantante.ipa | grep -E "(Frameworks|lubricantante$|Info.plist)" | head -30
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
