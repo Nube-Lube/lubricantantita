@@ -68,7 +68,7 @@ class DownloadManager: ObservableObject {
                 addItem("Error", status: .error, message: error.localizedDescription)
             }
             isDownloading = false
-            await LibraryManager.shared.reload()
+            LibraryManager.shared.reload()
         }
     }
 
@@ -274,13 +274,16 @@ class DownloadManager: ObservableObject {
         let title = (json["videoDetails"] as? [String: Any])?["title"]
                     as? String ?? "YouTube Track"
 
-        let formats = (json["streamingData"] as? [String: Any])?
-            ["adaptiveFormats"] as? [[String: Any]] ?? []
+        let formats = ((json["streamingData"] as? [String: Any])?["adaptiveFormats"] as? [[String: Any]]) ?? []
 
         let audioOnly = formats
-            .filter { ($0["mimeType"] as? String)?.hasPrefix("audio") == true
-                      && $0["url"] is String }
-            .sorted { ($0["bitrate"] as? Int ?? 0) > ($1["bitrate"] as? Int ?? 0) }
+            .filter { f in
+                guard let mime = f["mimeType"] as? String else { return false }
+                return mime.hasPrefix("audio") && f["url"] is String
+            }
+            .sorted { a, b in
+                (a["bitrate"] as? Int ?? 0) > (b["bitrate"] as? Int ?? 0)
+            }
 
         guard let best   = audioOnly.first,
               let urlStr = best["url"] as? String,
