@@ -319,6 +319,13 @@ class DownloadManager: ObservableObject {
 
         let formats = ((json["streamingData"] as? [String: Any])?["adaptiveFormats"] as? [[String: Any]]) ?? []
 
+        // Debug: log top-level keys and streamingData structure
+        let topKeys = Array(json.keys).joined(separator: ", ")
+        let streamingKeys = (json["streamingData"] as? [String: Any]).map {
+            Array($0.keys).joined(separator: ", ")
+        } ?? "nil"
+        let playStatus = (json["playabilityStatus"] as? [String: Any])?["status"] as? String ?? "nil"
+
         // Debug: log what format types are available
         let allMimeTypes = formats.compactMap { $0["mimeType"] as? String }
         let hasUrls = formats.filter { $0["url"] is String }.count
@@ -335,7 +342,7 @@ class DownloadManager: ObservableObject {
             }
 
         guard let best = audioOnly.first else {
-            let debugMsg = "No audio stream. Formats: \(allMimeTypes.prefix(5).joined(separator: ", ")). URLs: \(hasUrls), Ciphers: \(hasCiphers)"
+            let debugMsg = "No audio stream. Formats:\(allMimeTypes.prefix(5).joined(separator: ",")). URLs:\(hasUrls), Ciphers:\(hasCiphers). Status:\(playStatus). TopKeys:\(topKeys). StreamKeys:\(streamingKeys)"
             throw ytErr(debugMsg)
         }
 
