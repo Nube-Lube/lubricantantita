@@ -249,16 +249,21 @@ class DownloadManager: ObservableObject {
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
         req.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
         req.timeoutInterval = 30
-        // Apply auth cookies and headers if signed in
         for (k, v) in authHeaders { req.setValue(v, forHTTPHeaderField: k) }
+
+        // TVHTML5_SIMPLY_EMBEDDED_PLAYER bypasses age/region restrictions
+        // while still working with auth cookies to avoid bot detection
         req.httpBody = try JSONSerialization.data(withJSONObject: [
             "videoId": videoId,
             "context": [
                 "client": [
-                    "clientName":    "WEB",
-                    "clientVersion": "2.20231121.08.00",
+                    "clientName":    "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                    "clientVersion": "2.0",
                     "hl":            "en",
                     "gl":            "US",
+                ],
+                "thirdParty": [
+                    "embedUrl": "https://www.youtube.com"
                 ]
             ]
         ])
@@ -267,15 +272,31 @@ class DownloadManager: ObservableObject {
         var resp: URLResponse
         (data, resp) = try await URLSession.shared.data(for: req)
 
-        // If not signed in and got 400, show helpful error
+        // Fallback to WEB client if embedded player gets 400
         if (resp as? HTTPURLResponse)?.statusCode == 400 {
-            if !AuthManager.shared.isSignedIn {
-                throw ytErr("Sign in to your Google account in Settings to download")
-            }
-            throw ytErr("YouTube rejected the request (400) — try signing out and back in")
+            var req2 = URLRequest(url: playerURL)
+            req2.httpMethod = "POST"
+            req2.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req2.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+            req2.timeoutInterval = 30
+            for (k, v) in authHeaders { req2.setValue(v, forHTTPHeaderField: k) }
+            req2.httpBody = try JSONSerialization.data(withJSONObject: [
+                "videoId": videoId,
+                "context": [
+                    "client": [
+                        "clientName":    "WEB",
+                        "clientVersion": "2.20231121.08.00",
+                        "hl": "en", "gl": "US",
+                    ]
+                ]
+            ])
+            (data, resp) = try await URLSession.shared.data(for: req2)
         }
 
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            if !AuthManager.shared.isSignedIn {
+                throw ytErr("Sign in to your Google account in Settings to download")
+            }
             throw ytErr("Server returned \((resp as? HTTPURLResponse)?.statusCode ?? 0)")
         }
 
@@ -284,9 +305,13 @@ class DownloadManager: ObservableObject {
             throw ytErr("Bad JSON response")
         }
 
-        if let ps = json["playabilityStatus"] as? [String: Any],
-           (ps["status"] as? String) != "OK" {
-            throw ytErr(ps["reason"] as? String ?? "Video unavailable")
+        if let ps = json["playabilityStatus"] as? [String: Any] {
+            let status = ps["status"] as? String ?? "OK"
+            // Only hard-fail on login required or content error
+            // UNPLAYABLE and AGE_CHECK_REQUIRED may still have streams
+            if status == "ERROR" || status == "LOGIN_REQUIRED" {
+                throw ytErr(ps["reason"] as? String ?? "Video unavailable")
+            }
         }
 
         let title = (json["videoDetails"] as? [String: Any])?["title"]
