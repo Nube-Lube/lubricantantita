@@ -236,31 +236,29 @@ class DownloadManager: ObservableObject {
         let key = "vid_\(videoId)"
         addItem(key, status: .downloading, message: "Fetching stream…")
 
-        // Fetch visitorData first — required since late 2024 to bypass bot check
-        var visitorData = ""
-        if let vd = try? await fetchVisitorData() { visitorData = vd }
+        // Get auth headers — if signed in, bypasses bot check entirely
+        let authHeaders = await AuthManager.shared.authHeaders()
 
-        // iOS client is most reliable for direct API calls
         let playerURL = URL(string:
             "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
         var req = URLRequest(url: playerURL)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15",
                      forHTTPHeaderField: "User-Agent")
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        req.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
         req.timeoutInterval = 30
+        // Apply auth cookies and headers if signed in
+        for (k, v) in authHeaders { req.setValue(v, forHTTPHeaderField: k) }
         req.httpBody = try JSONSerialization.data(withJSONObject: [
             "videoId": videoId,
             "context": [
                 "client": [
-                    "clientName":    "IOS",
-                    "clientVersion": "19.29.1",
-                    "deviceModel":   "iPhone16,2",
-                    "userAgent":     "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+                    "clientName":    "WEB",
+                    "clientVersion": "2.20231121.08.00",
                     "hl":            "en",
                     "gl":            "US",
-                    "visitorData":   visitorData,
                 ]
             ]
         ])
@@ -269,23 +267,12 @@ class DownloadManager: ObservableObject {
         var resp: URLResponse
         (data, resp) = try await URLSession.shared.data(for: req)
 
-        // If iOS client gets 400, try TVHTML5 client as fallback
+        // If not signed in and got 400, show helpful error
         if (resp as? HTTPURLResponse)?.statusCode == 400 {
-            var req2 = URLRequest(url: playerURL)
-            req2.httpMethod = "POST"
-            req2.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req2.timeoutInterval = 30
-            req2.httpBody = try JSONSerialization.data(withJSONObject: [
-                "videoId": videoId,
-                "context": [
-                    "client": [
-                        "clientName":    "TVHTML5",
-                        "clientVersion": "7.20230405.08.00",
-                        "hl": "en", "gl": "US",
-                    ]
-                ]
-            ])
-            (data, resp) = try await URLSession.shared.data(for: req2)
+            if !AuthManager.shared.isSignedIn {
+                throw ytErr("Sign in to your Google account in Settings to download")
+            }
+            throw ytErr("YouTube rejected the request (400) — try signing out and back in")
         }
 
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
@@ -348,50 +335,6 @@ class DownloadManager: ObservableObject {
         )
         LibraryManager.shared.add(track)
         updateItem(title, status: .done, message: "Saved ✓")
-    }
-
-    // MARK: - Visitor Data (required to bypass bot check since late 2024)
-
-    private func fetchVisitorData() async throws -> String {
-        var req = URLRequest(url: URL(string:
-            "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 10
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
-            "context": [
-                "client": [
-                    "clientName": "WEB",
-                    "clientVersion": "2.20231121.08.00",
-                    "hl": "en", "gl": "US",
-                ]
-            ]
-        ])
-        let (data, _) = try await URLSession.shared.data(for: req)
-        guard let json = try JSONSerialization.jsonObject(with: data)
-                as? [String: Any],
-              let vd = json["visitorData"] as? String else {
-            // Fall back to fetching from YouTube homepage
-            return try await fetchVisitorDataFromHomepage()
-        }
-        return vd
-    }
-
-    private func fetchVisitorDataFromHomepage() async throws -> String {
-        var req = URLRequest(url: URL(string: "https://www.youtube.com/")!)
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15",
-                     forHTTPHeaderField: "User-Agent")
-        req.timeoutInterval = 10
-        let (data, _) = try await URLSession.shared.data(for: req)
-        guard let html = String(data: data, encoding: .utf8),
-              let r = html.range(of: "\"visitorData\":\"([^\"]+)\"",
-                                  options: .regularExpression),
-              let vr = html[r].range(of: "\"([^\"]+)\"$",
-                                     options: .regularExpression) else {
-            return ""
-        }
-        let raw = String(html[r][vr])
-        return raw.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
     }
 
     // MARK: - Utilities
