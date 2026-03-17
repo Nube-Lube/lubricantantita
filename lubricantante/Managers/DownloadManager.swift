@@ -1,13 +1,14 @@
 import Foundation
 import WebKit
 import Combine
+import UniformTypeIdentifiers
+import UIKit
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DownloadManager
-//
-// Uses WKWebView to load YouTube and intercept its own player API responses.
-// This is the only reliable approach on iOS — we let YouTube's own JavaScript
-// run BotGuard/PO token generation, then intercept the stream URLs it fetches.
+// Two download paths:
+//   1. YouTube: loads watch page in WKWebView, extracts ytInitialPlayerResponse
+//   2. Local files: imports from Files app or Camera Roll
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum DLStatus { case pending, downloading, done, error }
@@ -20,165 +21,69 @@ struct DLItem: Identifiable {
 }
 
 @MainActor
-class DownloadManager: NSObject, ObservableObject, WKScriptMessageHandler {
+class DownloadManager: NSObject, ObservableObject {
     static let shared = DownloadManager()
 
     @Published var items: [DLItem] = []
     @Published var isDownloading   = false
 
-    private var webView:   WKWebView?
-    private var pendingVideoIds: [String] = []
-    private var currentAlbum = "YouTube"
-    private var interceptedStreams: [String: StreamInfo] = [:] // videoId → stream
+    private var webView: WKWebView?
     private var pendingContinuations: [String: CheckedContinuation<StreamInfo, Error>] = [:]
     private let docs = FileManager.default.urls(
         for: .documentDirectory, in: .userDomainMask)[0]
 
     struct StreamInfo {
-        let url:      String
-        let mimeType: String
-        let title:    String
+        let url: String; let mimeType: String; let title: String
     }
 
-    override init() {
-        super.init()
-        setupWebView()
-    }
+    override init() { super.init(); setupWebView() }
 
     // ── WebView setup ─────────────────────────────────────────────────────
     private func setupWebView() {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = WKWebsiteDataStore.default()
-        config.mediaTypesRequiringUserActionForPlayback = []
+        config.mediaTypesRequiringUserActionForPlayback = .all
 
-        let interceptScript = WKUserScript(source: """
-        (function() {
-            function tryExtract(data) {
-                try {
-                    const videoId = data?.videoDetails?.videoId;
-                    const title   = data?.videoDetails?.title || 'YouTube Track';
-                    const formats = data?.streamingData?.adaptiveFormats || [];
-                    const audio   = formats
-                        .filter(f => f.mimeType && f.mimeType.startsWith('audio') && f.url)
-                        .sort((a,b) => (b.bitrate||0)-(a.bitrate||0));
-                    if (audio.length > 0 && videoId) {
-                        window.webkit.messageHandlers.streamIntercepted.postMessage({
-                            videoId:  videoId,
-                            title:    title,
-                            url:      audio[0].url,
-                            mimeType: audio[0].mimeType.split(';')[0]
-                        });
-                        return true;
-                    }
-                } catch(e) {}
-                return false;
-            }
+        // Message handler to receive stream info from JS
+        config.userContentController.add(
+            WeakScriptHandler(target: self), name: "streamReady")
 
-            // Intercept fetch
-            const origFetch = window.fetch;
-            window.fetch = async function(...args) {
-                const res = await origFetch(...args);
-                const url = (typeof args[0]==='string' ? args[0] : args[0]?.url) || '';
-                if (url.includes('/youtubei/v1/player')) {
-                    res.clone().json().then(tryExtract).catch(()=>{});
-                }
-                return res;
-            };
-
-            // Intercept XHR
-            const origOpen = XMLHttpRequest.prototype.open;
-            const origSend = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.open = function(m,u,...r){this._u=u;return origOpen.call(this,m,u,...r);};
-            XMLHttpRequest.prototype.send = function(b){
-                if(this._u && this._u.includes('/youtubei/v1/player')){
-                    this.addEventListener('load',function(){
-                        try{tryExtract(JSON.parse(this.responseText));}catch(e){}
-                    });
-                }
-                return origSend.call(this,b);
-            };
-
-            // Also poll ytInitialPlayerResponse which is set synchronously
-            let attempts = 0;
-            const poll = setInterval(function() {
-                if(window.ytInitialPlayerResponse){
-                    if(tryExtract(window.ytInitialPlayerResponse)) clearInterval(poll);
-                }
-                if(++attempts > 20) clearInterval(poll);
-            }, 500);
-        })();
-        """, injectionTime: .atDocumentStart, forMainFrameOnly: false)
-
-        config.userContentController.add(self, name: "streamIntercepted")
-        config.userContentController.addUserScript(interceptScript)
-
-        let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1),
+        let wv = WKWebView(frame: CGRect(x: -2, y: -2, width: 1, height: 1),
                            configuration: config)
         wv.navigationDelegate = self
-        wv.alpha = 0.001 // nearly invisible but attached and running
+        wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
-        // Attach to key window so iOS executes JS properly
-        DispatchQueue.main.async {
-            if let window = UIApplication.shared.connectedScenes
-                .compactMap({ $0 as? UIWindowScene })
-                .first?.windows.first {
-                window.addSubview(wv)
-            }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .first?.windows.first?.addSubview(wv)
         }
-
         self.webView = wv
     }
 
-    // ── WKScriptMessageHandler — receives intercepted stream data ─────────
-    nonisolated func userContentController(_ controller: WKUserContentController,
-                                           didReceive message: WKScriptMessage) {
-        guard message.name == "streamIntercepted",
-              let body     = message.body as? [String: Any],
-              let videoId  = body["videoId"]  as? String,
-              let urlStr   = body["url"]       as? String,
-              let mime     = body["mimeType"]  as? String,
-              let title    = body["title"]     as? String
-        else { return }
-
-        let stream = StreamInfo(url: urlStr, mimeType: mime, title: title)
-        Task { @MainActor in
-            self.interceptedStreams[videoId] = stream
-            if let cont = self.pendingContinuations[videoId] {
-                cont.resume(returning: stream)
-                self.pendingContinuations.removeValue(forKey: videoId)
-            }
-        }
-    }
-
-    // ── Entry point ───────────────────────────────────────────────────────
+    // ── Entry point: YouTube ──────────────────────────────────────────────
     func start(urlString: String) {
         guard !isDownloading else { return }
-        isDownloading = true
-        items.removeAll()
-
+        isDownloading = true; items.removeAll()
         Task {
             do {
                 if let listId = extractPlaylistId(from: urlString),
                    !urlString.contains("watch?v=") {
-                    try await downloadPlaylist(listId: listId, originalURL: urlString)
+                    try await downloadPlaylist(listId: listId)
                 } else if let videoId = extractVideoId(from: urlString) {
-                    try await downloadSingleVideo(videoId: videoId, album: "YouTube")
+                    try await downloadVideo(videoId: videoId, album: "YouTube")
                 } else {
-                    addItem("Error", status: .error, message: "Could not find video or playlist ID")
+                    addItem("Error", status: .error, message: "No video or playlist ID found")
                 }
-            } catch {
-                addItem("Error", status: .error, message: error.localizedDescription)
-            }
+            } catch { addItem("Error", status: .error, message: error.localizedDescription) }
             isDownloading = false
             LibraryManager.shared.reload()
         }
     }
 
-    // ── Playlist ──────────────────────────────────────────────────────────
-    private func downloadPlaylist(listId: String, originalURL: String) async throws {
+    // ── Playlist metadata via InnerTube browse (no PO token needed) ───────
+    private func downloadPlaylist(listId: String) async throws {
         addItem("Playlist", status: .downloading, message: "Fetching playlist…")
-
-        // Use InnerTube browse (no PO token needed for metadata)
         var req = URLRequest(url: URL(string:
             "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false")!)
         req.httpMethod = "POST"
@@ -187,11 +92,9 @@ class DownloadManager: NSObject, ObservableObject, WKScriptMessageHandler {
             "browseId": "VL\(listId)",
             "context": ["client": ["clientName": "WEB", "clientVersion": "2.20231121.08.00"]]
         ])
-
         let (data, _) = try await URLSession.shared.data(for: req)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw dlErr("Could not parse playlist")
-        }
+        guard let json = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any] else { throw dlErr("Could not parse playlist") }
 
         var name = "YouTube Playlist"
         if let h = json["header"] as? [String: Any],
@@ -200,87 +103,190 @@ class DownloadManager: NSObject, ObservableObject, WKScriptMessageHandler {
            let runs = t["runs"] as? [[String: Any]] {
             name = runs.first?["text"] as? String ?? name
         }
-
-        var videoIds: [String] = []
-        extractVideoIds(from: json, into: &videoIds)
-
-        guard !videoIds.isEmpty else { throw dlErr("No videos found in playlist") }
-
+        var ids: [String] = []
+        extractVideoIds(from: json, into: &ids)
+        guard !ids.isEmpty else { throw dlErr("No videos found in playlist") }
         updateItem("Playlist", status: .pending,
-                   message: "\(name) — \(videoIds.count) tracks")
-
-        for id in videoIds {
-            try await downloadSingleVideo(videoId: id, album: name)
-        }
+                   message: "\(name) — \(ids.count) tracks")
+        for id in ids { try await downloadVideo(videoId: id, album: name) }
     }
 
-    // ── Single video via WebView interception ─────────────────────────────
-    private func downloadSingleVideo(videoId: String, album: String) async throws {
+    // ── Single video: load in WebView, extract ytInitialPlayerResponse ────
+    private func downloadVideo(videoId: String, album: String) async throws {
         let key = "vid_\(videoId)"
-        addItem(key, status: .downloading, message: "Loading…")
+        addItem(key, status: .downloading, message: "Loading YouTube…")
 
-        // Get stream by loading the YouTube watch page in the hidden WebView
-        // YouTube's own JS runs BotGuard, generates PO token, fetches player API
-        // Our injected script intercepts the response and sends us the audio URL
-        let stream = try await getStream(for: videoId)
+        let stream = try await withCheckedThrowingContinuation { cont in
+            pendingContinuations[videoId] = cont
+            // Load mobile YouTube — it populates ytInitialPlayerResponse synchronously
+            let url = URL(string: "https://m.youtube.com/watch?v=\(videoId)&bpctr=9999999999&has_verified=1")!
+            var req = URLRequest(url: url)
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+                         forHTTPHeaderField: "User-Agent")
+            webView?.load(req)
+
+            // Timeout
+            Task {
+                try? await Task.sleep(nanoseconds: 35_000_000_000)
+                await MainActor.run {
+                    if let c = self.pendingContinuations.removeValue(forKey: videoId) {
+                        c.resume(throwing: self.dlErr("Timed out — try again or check internet"))
+                    }
+                }
+            }
+        }
 
         updateItem(key, newTitle: stream.title, status: .downloading,
-                   message: "Downloading…")
+                   message: "Downloading audio…")
 
         let ext  = stream.mimeType.contains("webm") ? "webm" : "m4a"
         let safe = sanitize(stream.title)
-        let albumDir = docs.appendingPathComponent(sanitize(album))
-        try? FileManager.default.createDirectory(at: albumDir,
-                                                  withIntermediateDirectories: true)
-        let dest = albumDir.appendingPathComponent("\(safe).\(ext)")
+        let dir  = docs.appendingPathComponent(sanitize(album))
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent("\(safe).\(ext)")
         try? FileManager.default.removeItem(at: dest)
 
-        guard let audioURL = URL(string: stream.url) else {
-            throw dlErr("Invalid audio URL")
-        }
-        let (tmpURL, _) = try await URLSession.shared.download(from: audioURL)
-        try FileManager.default.moveItem(at: tmpURL, to: dest)
+        guard let audioURL = URL(string: stream.url) else { throw dlErr("Bad URL") }
+        let (tmp, _) = try await URLSession.shared.download(from: audioURL)
+        try FileManager.default.moveItem(at: tmp, to: dest)
 
-        let track = Track(id: UUID(), name: stream.title, album: album,
-                          filename: "\(sanitize(album))/\(safe).\(ext)",
-                          addedAt: Date())
-        LibraryManager.shared.add(track)
+        LibraryManager.shared.add(Track(id: UUID(), name: stream.title, album: album,
+            filename: "\(sanitize(album))/\(safe).\(ext)", addedAt: Date()))
         updateItem(stream.title, status: .done, message: "Saved ✓")
     }
 
-    // ── Load YouTube watch page and wait for intercepted stream ───────────
-    private func getStream(for videoId: String) async throws -> StreamInfo {
-        // Check if already intercepted (e.g. from a previous page load)
-        if let cached = interceptedStreams[videoId] { return cached }
+    // ── Called by WKNavigationDelegate after page finishes loading ────────
+    func extractStreamFromPage(videoId: String) {
+        let js = """
+        (function() {
+            // Try ytInitialPlayerResponse first (set synchronously on page load)
+            var data = window.ytInitialPlayerResponse;
 
-        return try await withCheckedThrowingContinuation { continuation in
-            pendingContinuations[videoId] = continuation
-
-            let url = URL(string: "https://www.youtube.com/watch?v=\(videoId)")!
-            webView?.load(URLRequest(url: url))
-
-            // Timeout after 30s
-            Task {
-                try? await Task.sleep(nanoseconds: 30_000_000_000)
-                await MainActor.run {
-                    if let cont = self.pendingContinuations[videoId] {
-                        cont.resume(throwing: self.dlErr("Timed out loading video \(videoId)"))
-                        self.pendingContinuations.removeValue(forKey: videoId)
+            // Fallback: search inline scripts for the JSON
+            if (!data) {
+                var scripts = document.querySelectorAll('script');
+                for (var i = 0; i < scripts.length; i++) {
+                    var t = scripts[i].textContent;
+                    var idx = t.indexOf('ytInitialPlayerResponse');
+                    if (idx >= 0) {
+                        try {
+                            var start = t.indexOf('{', idx);
+                            // Find matching closing brace
+                            var depth = 0, end = start;
+                            for (; end < Math.min(t.length, start + 500000); end++) {
+                                if (t[end] === '{') depth++;
+                                else if (t[end] === '}') { depth--; if (depth === 0) break; }
+                            }
+                            data = JSON.parse(t.substring(start, end + 1));
+                            break;
+                        } catch(e) {}
                     }
+                }
+            }
+
+            if (!data) return JSON.stringify({error: 'ytInitialPlayerResponse not found'});
+
+            var title = (data.videoDetails || {}).title || 'YouTube Track';
+            var formats = (data.streamingData || {}).adaptiveFormats || [];
+            var audio = formats
+                .filter(function(f){ return f.mimeType && f.mimeType.indexOf('audio') === 0 && f.url; })
+                .sort(function(a,b){ return (b.bitrate||0)-(a.bitrate||0); });
+
+            if (audio.length === 0) {
+                return JSON.stringify({
+                    error: 'No audio streams. Status: ' +
+                        ((data.playabilityStatus||{}).status||'unknown') +
+                        ' Reason: ' + ((data.playabilityStatus||{}).reason||'none')
+                });
+            }
+
+            return JSON.stringify({
+                videoId: (data.videoDetails||{}).videoId || '',
+                title:   title,
+                url:     audio[0].url,
+                mime:    audio[0].mimeType.split(';')[0]
+            });
+        })();
+        """
+
+        webView?.evaluateJavaScript(js) { [weak self] result, error in
+            guard let self = self else { return }
+            Task { @MainActor in
+                guard let jsonStr = result as? String,
+                      let jsonData = jsonStr.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: jsonData)
+                                  as? [String: Any] else {
+                    if let c = self.pendingContinuations.removeValue(forKey: videoId) {
+                        c.resume(throwing: self.dlErr("JS evaluation failed"))
+                    }
+                    return
+                }
+
+                if let errMsg = json["error"] as? String {
+                    if let c = self.pendingContinuations.removeValue(forKey: videoId) {
+                        c.resume(throwing: self.dlErr(errMsg))
+                    }
+                    return
+                }
+
+                guard let url   = json["url"]   as? String,
+                      let title = json["title"] as? String,
+                      let mime  = json["mime"]  as? String else {
+                    if let c = self.pendingContinuations.removeValue(forKey: videoId) {
+                        c.resume(throwing: self.dlErr("Missing stream fields"))
+                    }
+                    return
+                }
+
+                let stream = StreamInfo(url: url, mimeType: mime, title: title)
+                if let c = self.pendingContinuations.removeValue(forKey: videoId) {
+                    c.resume(returning: stream)
                 }
             }
         }
     }
 
+    // ── Local file import ─────────────────────────────────────────────────
+    func importLocalFiles(_ urls: [URL], album: String = "Local") {
+        Task {
+            for url in urls {
+                let accessing = url.startAccessingSecurityScopedResource()
+                defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+
+                let name = url.deletingPathExtension().lastPathComponent
+                let ext  = url.pathExtension.lowercased()
+                let safe = sanitize(name)
+
+                addItem(name, status: .downloading, message: "Importing…")
+
+                do {
+                    let dir  = docs.appendingPathComponent(sanitize(album))
+                    try? FileManager.default.createDirectory(
+                        at: dir, withIntermediateDirectories: true)
+                    let dest = dir.appendingPathComponent("\(safe).\(ext)")
+                    try? FileManager.default.removeItem(at: dest)
+                    try FileManager.default.copyItem(at: url, to: dest)
+
+                    LibraryManager.shared.add(Track(
+                        id: UUID(), name: name, album: album,
+                        filename: "\(sanitize(album))/\(safe).\(ext)",
+                        addedAt: Date()))
+                    updateItem(name, status: .done, message: "Imported ✓")
+                } catch {
+                    updateItem(name, status: .error, message: error.localizedDescription)
+                }
+            }
+            LibraryManager.shared.reload()
+        }
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
     private func extractVideoIds(from obj: Any, into ids: inout [String]) {
-        if let dict = obj as? [String: Any] {
-            if let r = dict["playlistVideoRenderer"] as? [String: Any],
+        if let d = obj as? [String: Any] {
+            if let r = d["playlistVideoRenderer"] as? [String: Any],
                let v = r["videoId"] as? String, !ids.contains(v) { ids.append(v) }
-            dict.values.forEach { extractVideoIds(from: $0, into: &ids) }
-        } else if let arr = obj as? [Any] {
-            arr.forEach { extractVideoIds(from: $0, into: &ids) }
-        }
+            d.values.forEach { extractVideoIds(from: $0, into: &ids) }
+        } else if let a = obj as? [Any] { a.forEach { extractVideoIds(from: $0, into: &ids) } }
     }
 
     private func extractVideoId(from url: String) -> String? {
@@ -304,9 +310,8 @@ class DownloadManager: NSObject, ObservableObject, WKScriptMessageHandler {
          .trimmingCharacters(in: .whitespaces)
     }
 
-    private func dlErr(_ msg: String) -> NSError {
-        NSError(domain: "Download", code: 0,
-                userInfo: [NSLocalizedDescriptionKey: msg])
+    private func dlErr(_ m: String) -> NSError {
+        NSError(domain: "DL", code: 0, userInfo: [NSLocalizedDescriptionKey: m])
     }
 
     private func addItem(_ title: String, status: DLStatus, message: String) {
@@ -316,21 +321,42 @@ class DownloadManager: NSObject, ObservableObject, WKScriptMessageHandler {
     private func updateItem(_ title: String, newTitle: String? = nil,
                             status: DLStatus, message: String) {
         guard let i = items.firstIndex(where: { $0.title == title }) else { return }
-        items[i].status  = status
-        items[i].message = message
+        items[i].status = status; items[i].message = message
         if let t = newTitle { items[i].title = t }
     }
 }
 
+// ── Weak reference wrapper to avoid retain cycle in WKUserContentController ──
+class WeakScriptHandler: NSObject, WKScriptMessageHandler {
+    weak var target: DownloadManager?
+    init(target: DownloadManager) { self.target = target }
+    func userContentController(_ c: WKUserContentController,
+                               didReceive msg: WKScriptMessage) {}
+}
+
 // ── WKNavigationDelegate ──────────────────────────────────────────────────────
 extension DownloadManager: WKNavigationDelegate {
-    nonisolated func webView(_ webView: WKWebView, didFail navigation: WKNavigation!,
+    nonisolated func webView(_ wv: WKWebView, didFinish nav: WKNavigation!) {
+        guard let urlStr = wv.url?.absoluteString,
+              let videoId = urlStr.components(separatedBy: "v=").last?
+                                   .components(separatedBy: "&").first,
+              videoId.count == 11 else { return }
+        Task { @MainActor in self.extractStreamFromPage(videoId: videoId) }
+    }
+
+    nonisolated func webView(_ wv: WKWebView, didFail nav: WKNavigation!,
                               withError error: Error) {
         Task { @MainActor in
-            // Fail all pending continuations
-            for (id, cont) in self.pendingContinuations {
-                cont.resume(throwing: error)
-            }
+            for (_, cont) in self.pendingContinuations { cont.resume(throwing: error) }
+            self.pendingContinuations.removeAll()
+        }
+    }
+
+    nonisolated func webView(_ wv: WKWebView,
+                              didFailProvisionalNavigation nav: WKNavigation!,
+                              withError error: Error) {
+        Task { @MainActor in
+            for (_, cont) in self.pendingContinuations { cont.resume(throwing: error) }
             self.pendingContinuations.removeAll()
         }
     }
