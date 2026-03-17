@@ -4,13 +4,13 @@ import Combine
 import UniformTypeIdentifiers
 import UIKit
 
-// ─────────────────────────────────────────────────────────────────────────────
 // DownloadManager
 // Download priority order:
-//   1. server.py  — if ServerManager.shared.isConnected && hasYtdlp
-//   2. InnerTube  — direct ANDROID client API, no WebView needed
-//   3. WebView    — original fallback (loads embed page, scrapes stream URL)
-// ─────────────────────────────────────────────────────────────────────────────
+//   1. Proxy server  -- if ServerManager.shared.isConnected && hasYtdlp
+//      Sends URL to /api/fetch, server yt-dlp downloads + streams bytes back,
+//      deletes temp file. No storage on server -- works on Render free tier.
+//   2. InnerTube ANDROID client -- direct API, no WebView needed
+//   3. WebView fallback -- original embed-page approach
 
 enum DLStatus { case pending, downloading, done, error }
 
@@ -28,7 +28,6 @@ class DownloadManager: NSObject, ObservableObject {
     @Published var items: [DLItem] = []
     @Published var isDownloading   = false
 
-    // WebView path (kept as fallback)
     private var webView: WKWebView?
     private var pendingContinuations: [String: CheckedContinuation<StreamInfo, Error>] = [:]
 
@@ -41,7 +40,8 @@ class DownloadManager: NSObject, ObservableObject {
 
     override init() { super.init() }
 
-    // ── WebView (lazy) ────────────────────────────────────────────────────
+    // MARK: - WebView (lazy)
+
     private func ensureWebView() {
         guard webView == nil else { return }
         let config = WKWebViewConfiguration()
@@ -63,7 +63,8 @@ class DownloadManager: NSObject, ObservableObject {
         self.webView = wv
     }
 
-    // ── Public entry point ────────────────────────────────────────────────
+    // MARK: - Public entry point
+
     func start(urlString: String) {
         guard !isDownloading else { return }
         isDownloading = true
@@ -73,11 +74,9 @@ class DownloadManager: NSObject, ObservableObject {
             do {
                 let srv = ServerManager.shared
                 if srv.isConnected && srv.hasYtdlp {
-                    // Path 1: offload to server.py yt-dlp over WiFi
                     try await downloadViaServer(urlString: urlString,
                                                 serverBase: srv.base)
                 } else {
-                    // Path 2 / 3: on-device
                     if let listId = extractPlaylistId(from: urlString),
                        !urlString.contains("watch?v=") {
                         try await downloadPlaylist(listId: listId)
@@ -96,133 +95,135 @@ class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // PATH 1 — server.py yt-dlp over local WiFi
-    // ─────────────────────────────────────────────────────────────────────
+    // MARK: - PATH 1: Proxy server (/api/fetch)
+    // Server downloads via yt-dlp into a temp file, streams bytes back,
+    // then deletes the temp file. No persistent storage on the server.
 
     private func downloadViaServer(urlString: String, serverBase: String) async throws {
-        let encoded = urlString.addingPercentEncoding(
-            withAllowedCharacters: .urlQueryAllowed) ?? urlString
-        guard let endpoint = URL(string: "\(serverBase)/api/youtube?url=\(encoded)")
-        else { throw dlErr("Invalid server URL") }
+        // Playlists: extract IDs client-side, then download each track through server
+        if let listId = extractPlaylistId(from: urlString),
+           !urlString.contains("watch?v=") {
+            try await downloadPlaylistViaServer(listId: listId, serverBase: serverBase)
+            return
+        }
 
-        var req = URLRequest(url: endpoint, timeoutInterval: 300)
-        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        // Single video
+        addItem("Track", status: .downloading, message: "Server is processing...")
+        try await fetchOneViaServer(youtubeURL: urlString,
+                                    placeholderTitle: "Track",
+                                    album: "YouTube",
+                                    serverBase: serverBase)
+    }
 
-        let session = ServerManager.shared.base.hasPrefix("https")
-            ? ServerManager.shared.localSession : URLSession.shared
-        let (bytes, resp) = try await session.bytes(for: req)
-        guard (resp as? HTTPURLResponse)?.statusCode == 200
-        else { throw dlErr("Server returned an error — check server console") }
+    // Playlist via server: resolve IDs client-side, download each via /api/fetch
+    private func downloadPlaylistViaServer(listId: String, serverBase: String) async throws {
+        addItem("Playlist", status: .downloading, message: "Fetching playlist info...")
+        var req = URLRequest(url: URL(string:
+            "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "browseId": "VL\(listId)",
+            "context": ["client": ["clientName": "WEB", "clientVersion": "2.20231121.08.00"]]
+        ])
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw dlErr("Could not parse playlist") }
 
-        var knownTitles = Set<String>()
+        var name = "YouTube Playlist"
+        if let h    = json["header"]              as? [String: Any],
+           let r    = h["playlistHeaderRenderer"] as? [String: Any],
+           let t    = r["title"]                  as? [String: Any],
+           let runs = t["runs"]                   as? [[String: Any]] {
+            name = runs.first?["text"] as? String ?? name
+        }
+        var ids: [String] = []
+        extractVideoIds(from: json, into: &ids)
+        guard !ids.isEmpty else { throw dlErr("No videos found in playlist") }
 
-        for try await line in bytes.lines {
-            guard line.hasPrefix("data: ") else { continue }
-            let jsonStr = String(line.dropFirst(6))
-            guard let data = jsonStr.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data)
-                             as? [String: Any]
-            else { continue }
+        updateItem("Playlist", status: .pending,
+                   message: "\(name) -- \(ids.count) tracks")
 
-            let status = json["status"] as? String ?? ""
-
-            switch status {
-
-            case "playlist":
-                let name  = json["name"]  as? String ?? "Playlist"
-                let total = json["total"] as? Int    ?? 0
-                addItem("Playlist: \(name)", status: .downloading,
-                        message: "\(total) tracks — server downloading")
-
-            case "downloading":
-                let track = json["track"] as? String ?? "Track"
-                let idx   = json["index"] as? Int
-                let tot   = json["total"] as? Int
-                let msg   = (idx != nil && tot != nil)
-                    ? "\(idx!) / \(tot!) — server"
-                    : "Server downloading…"
-                if !knownTitles.contains(track) {
-                    addItem(track, status: .downloading, message: msg)
-                    knownTitles.insert(track)
-                } else {
-                    updateItem(track, status: .downloading, message: msg)
-                }
-
-            case "done":
-                let track = json["track"] as? String ?? "Track"
-                let rel   = json["rel"]   as? String ?? ""
-                let parts = rel.split(separator: "/", maxSplits: 1)
-                let album: String = parts.count > 1 ? String(parts[0]) : "YouTube"
-                updateItem(track, status: .downloading,
-                           message: "Fetching audio from server…")
-                do {
-                    try await fetchFromServer(track: track, rel: rel,
-                                              album: album, serverBase: serverBase)
-                } catch {
-                    updateItem(track, status: .error,
-                               message: "Fetch failed: \(error.localizedDescription)")
-                }
-
-            case "error":
-                let track = json["track"] as? String
-                let msg   = json["error"] as? String ?? "Unknown error"
-                if let t = track {
-                    updateItem(t, status: .error, message: msg)
-                } else {
-                    addItem("Error", status: .error, message: msg)
-                }
-
-            case "complete":
-                break
-
-            default:
-                break
+        for (i, videoId) in ids.enumerated() {
+            let ytURL = "https://www.youtube.com/watch?v=\(videoId)"
+            let placeholder = "Track \(i + 1) of \(ids.count)"
+            addItem(placeholder, status: .downloading,
+                    message: "\(i + 1) / \(ids.count) -- server")
+            do {
+                try await fetchOneViaServer(youtubeURL: ytURL,
+                                            placeholderTitle: placeholder,
+                                            album: name,
+                                            serverBase: ServerManager.shared.base)
+            } catch {
+                updateItem(placeholder, status: .error,
+                           message: error.localizedDescription)
             }
         }
     }
 
-    /// Download one audio file from `/stream/<rel>` and save locally.
-    private func fetchFromServer(track: String, rel: String,
-                                 album: String, serverBase: String) async throws {
-        let encodedRel = rel.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed) ?? rel
-        guard let url = URL(string: "\(serverBase)/stream/\(encodedRel)")
-        else { throw dlErr("Bad stream URL") }
+    /// Hit /api/fetch?url=..., receive the audio file, save it.
+    private func fetchOneViaServer(youtubeURL: String,
+                                   placeholderTitle: String,
+                                   album: String,
+                                   serverBase: String) async throws {
+        let encoded = youtubeURL.addingPercentEncoding(
+            withAllowedCharacters: .urlQueryAllowed) ?? youtubeURL
+        guard let endpoint = URL(string: "\(serverBase)/api/fetch?url=\(encoded)")
+        else { throw dlErr("Invalid server URL") }
 
-        let ext      = URL(fileURLWithPath: rel).pathExtension.lowercased()
-        let finalExt = ext.isEmpty ? "m4a" : ext
-        let safe     = sanitize(track)
-        let albumDir = sanitize(album)
-        let dir      = docs.appendingPathComponent(albumDir)
-        try? FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true)
-        let dest = dir.appendingPathComponent("\(safe).\(finalExt)")
-
-        if FileManager.default.fileExists(atPath: dest.path) {
-            updateItem(track, status: .done, message: "Already saved ✓")
-            return
-        }
+        // 180s timeout -- free tier servers cold-start in ~30s
+        var req = URLRequest(url: endpoint, timeoutInterval: 180)
+        req.cachePolicy = .reloadIgnoringLocalCacheData
 
         let session = serverBase.hasPrefix("https")
             ? ServerManager.shared.localSession : URLSession.shared
-        let (tmp, _) = try await session.download(from: url)
+
+        updateItem(placeholderTitle, status: .downloading,
+                   message: "Downloading via server...")
+
+        let (tmp, resp) = try await session.download(for: req)
+
+        guard let http = resp as? HTTPURLResponse else {
+            throw dlErr("No HTTP response from server")
+        }
+        if http.statusCode != 200 {
+            let body = (try? String(contentsOf: tmp)) ?? ""
+            if let d = body.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               let msg  = json["error"] as? String { throw dlErr(msg) }
+            throw dlErr("Server error: HTTP \(http.statusCode)")
+        }
+
+        // Server returns real title + ext in response headers
+        let rawTitle = http.value(forHTTPHeaderField: "X-Track-Title") ?? placeholderTitle
+        let ext      = http.value(forHTTPHeaderField: "X-Track-Ext")   ?? "m4a"
+        let title    = rawTitle.removingPercentEncoding ?? rawTitle
+
+        let safe     = sanitize(title)
+        let albumDir = sanitize(album)
+        let dir      = docs.appendingPathComponent(albumDir)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent("\(safe).\(ext)")
+        try? FileManager.default.removeItem(at: dest)
         try FileManager.default.moveItem(at: tmp, to: dest)
 
+        if title != placeholderTitle {
+            updateItem(placeholderTitle, newTitle: title, status: .done, message: "Saved")
+        } else {
+            updateItem(title, status: .done, message: "Saved")
+        }
+
         LibraryManager.shared.add(Track(
-            id: UUID(), name: track, album: album,
-            filename: "\(albumDir)/\(safe).\(finalExt)",
+            id: UUID(), name: title, album: album,
+            filename: "\(albumDir)/\(safe).\(ext)",
             addedAt: Date()))
-        updateItem(track, status: .done, message: "Saved ✓")
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // PATH 2 — InnerTube ANDROID client (no PO token / no WebView needed)
-    // ─────────────────────────────────────────────────────────────────────
+    // MARK: - PATH 2: InnerTube ANDROID client (no PO token needed)
 
     private func downloadVideoInnerTube(videoId: String, album: String) async throws {
         let key = "vid_\(videoId)"
-        addItem(key, status: .downloading, message: "Fetching stream info…")
+        addItem(key, status: .downloading, message: "Fetching stream info...")
 
         guard let apiURL = URL(string:
             "https://www.youtube.com/youtubei/v1/player" +
@@ -240,11 +241,10 @@ class DownloadManager: NSObject, ObservableObject {
             "videoId": videoId,
             "context": [
                 "client": [
-                    "clientName":       "ANDROID",
-                    "clientVersion":    "17.31.35",
+                    "clientName":        "ANDROID",
+                    "clientVersion":     "17.31.35",
                     "androidSdkVersion": 30,
-                    "hl": "en",
-                    "gl": "US"
+                    "hl": "en", "gl": "US"
                 ]
             ]
         ])
@@ -269,19 +269,18 @@ class DownloadManager: NSObject, ObservableObject {
 
         let adaptive = sd["adaptiveFormats"] as? [[String: Any]] ?? []
         let regular  = sd["formats"]         as? [[String: Any]] ?? []
-        let allFmts  = adaptive + regular
 
-        let audioFmts = allFmts.filter { f in
+        let audioFmts = (adaptive + regular).filter { f in
             guard let mime = f["mimeType"] as? String else { return false }
             return mime.hasPrefix("audio") && f["url"] != nil
         }.sorted { ($0["bitrate"] as? Int ?? 0) > ($1["bitrate"] as? Int ?? 0) }
 
-        guard let best      = audioFmts.first,
-              let streamURL  = best["url"]      as? String,
-              let mimeType   = best["mimeType"] as? String
+        guard let best     = audioFmts.first,
+              let streamURL = best["url"]      as? String,
+              let mimeType  = best["mimeType"] as? String
         else { throw dlErr("No audio streams from InnerTube") }
 
-        updateItem(key, newTitle: title, status: .downloading, message: "Downloading…")
+        updateItem(key, newTitle: title, status: .downloading, message: "Downloading...")
 
         let ext  = mimeType.contains("webm") ? "webm" : "m4a"
         let safe = sanitize(title)
@@ -298,19 +297,17 @@ class DownloadManager: NSObject, ObservableObject {
             id: UUID(), name: title, album: album,
             filename: "\(sanitize(album))/\(safe).\(ext)",
             addedAt: Date()))
-        updateItem(title, status: .done, message: "Saved ✓")
+        updateItem(title, status: .done, message: "Saved")
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // PATH 3 — WebView fallback
-    // ─────────────────────────────────────────────────────────────────────
+    // MARK: - PATH 3: WebView fallback
 
     private func downloadVideoWebView(videoId: String, album: String) async throws {
         let key = "vid_\(videoId)"
         if items.first(where: { $0.title == key }) != nil {
-            updateItem(key, status: .downloading, message: "WebView fallback…")
+            updateItem(key, status: .downloading, message: "WebView fallback...")
         } else {
-            addItem(key, status: .downloading, message: "Loading YouTube…")
+            addItem(key, status: .downloading, message: "Loading YouTube...")
         }
 
         let stream = try await withCheckedThrowingContinuation { cont in
@@ -331,7 +328,8 @@ class DownloadManager: NSObject, ObservableObject {
             }
         }
 
-        updateItem(key, newTitle: stream.title, status: .downloading, message: "Downloading…")
+        updateItem(key, newTitle: stream.title, status: .downloading,
+                   message: "Downloading...")
 
         let ext  = stream.mimeType.contains("webm") ? "webm" : "m4a"
         let safe = sanitize(stream.title)
@@ -348,25 +346,26 @@ class DownloadManager: NSObject, ObservableObject {
             id: UUID(), name: stream.title, album: album,
             filename: "\(sanitize(album))/\(safe).\(ext)",
             addedAt: Date()))
-        updateItem(stream.title, status: .done, message: "Saved ✓")
+        updateItem(stream.title, status: .done, message: "Saved")
     }
 
-    // ── Orchestrator: InnerTube → WebView ────────────────────────────────
+    // Orchestrator: InnerTube -> WebView
     private func downloadVideo(videoId: String, album: String) async throws {
         do {
             try await downloadVideoInnerTube(videoId: videoId, album: album)
         } catch {
             let key = "vid_\(videoId)"
             updateItem(key, status: .downloading,
-                       message: "InnerTube failed, trying WebView…")
+                       message: "InnerTube failed, trying WebView...")
             ensureWebView()
             try await downloadVideoWebView(videoId: videoId, album: album)
         }
     }
 
-    // ── Playlist ──────────────────────────────────────────────────────────
+    // MARK: - Playlist (on-device)
+
     private func downloadPlaylist(listId: String) async throws {
-        addItem("Playlist", status: .downloading, message: "Fetching playlist…")
+        addItem("Playlist", status: .downloading, message: "Fetching playlist...")
         var req = URLRequest(url: URL(string:
             "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false")!)
         req.httpMethod = "POST"
@@ -380,20 +379,21 @@ class DownloadManager: NSObject, ObservableObject {
         else { throw dlErr("Could not parse playlist") }
 
         var name = "YouTube Playlist"
-        if let h    = json["header"]                as? [String: Any],
-           let r    = h["playlistHeaderRenderer"]   as? [String: Any],
-           let t    = r["title"]                    as? [String: Any],
-           let runs = t["runs"]                     as? [[String: Any]] {
+        if let h    = json["header"]              as? [String: Any],
+           let r    = h["playlistHeaderRenderer"] as? [String: Any],
+           let t    = r["title"]                  as? [String: Any],
+           let runs = t["runs"]                   as? [[String: Any]] {
             name = runs.first?["text"] as? String ?? name
         }
         var ids: [String] = []
         extractVideoIds(from: json, into: &ids)
         guard !ids.isEmpty else { throw dlErr("No videos found in playlist") }
-        updateItem("Playlist", status: .pending, message: "\(name) — \(ids.count) tracks")
+        updateItem("Playlist", status: .pending, message: "\(name) -- \(ids.count) tracks")
         for id in ids { try await downloadVideo(videoId: id, album: name) }
     }
 
-    // ── WebView JS extraction ─────────────────────────────────────────────
+    // MARK: - WebView JS extraction
+
     func extractStreamFromPage(videoId: String, attempt: Int = 0) {
         let js = """
         (function() {
@@ -486,7 +486,8 @@ class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    // ── Local file import ─────────────────────────────────────────────────
+    // MARK: - Local file import
+
     func importLocalFiles(_ urls: [URL], album: String = "Local") {
         Task {
             for url in urls {
@@ -496,7 +497,7 @@ class DownloadManager: NSObject, ObservableObject {
                 let name = url.deletingPathExtension().lastPathComponent
                 let ext  = url.pathExtension.lowercased()
                 let safe = sanitize(name)
-                addItem(name, status: .downloading, message: "Importing…")
+                addItem(name, status: .downloading, message: "Importing...")
 
                 do {
                     let dir  = docs.appendingPathComponent(sanitize(album))
@@ -509,7 +510,7 @@ class DownloadManager: NSObject, ObservableObject {
                         id: UUID(), name: name, album: album,
                         filename: "\(sanitize(album))/\(safe).\(ext)",
                         addedAt: Date()))
-                    updateItem(name, status: .done, message: "Imported ✓")
+                    updateItem(name, status: .done, message: "Imported")
                 } catch {
                     updateItem(name, status: .error, message: error.localizedDescription)
                 }
@@ -518,7 +519,8 @@ class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────
+    // MARK: - Helpers
+
     private func extractVideoIds(from obj: Any, into ids: inout [String]) {
         if let d = obj as? [String: Any] {
             if let r = d["playlistVideoRenderer"] as? [String: Any],
@@ -565,7 +567,8 @@ class DownloadManager: NSObject, ObservableObject {
     }
 }
 
-// ── Weak retain wrapper ───────────────────────────────────────────────────────
+// MARK: - Weak retain wrapper
+
 class WeakScriptHandler: NSObject, WKScriptMessageHandler {
     weak var target: DownloadManager?
     init(target: DownloadManager) { self.target = target }
@@ -573,7 +576,8 @@ class WeakScriptHandler: NSObject, WKScriptMessageHandler {
                                didReceive msg: WKScriptMessage) {}
 }
 
-// ── WKNavigationDelegate ──────────────────────────────────────────────────────
+// MARK: - WKNavigationDelegate
+
 extension DownloadManager: WKNavigationDelegate {
     nonisolated func webView(_ wv: WKWebView, didFinish nav: WKNavigation!) {
         guard let urlStr = wv.url?.absoluteString else { return }
