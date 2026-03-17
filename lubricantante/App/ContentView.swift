@@ -25,7 +25,7 @@ struct ContentView: View {
 
             YouTubeView()
                 .tabItem {
-                    Label("YouTube", systemImage: "play.rectangle.fill")
+                    Label("Download", systemImage: "arrow.down.circle.fill")
                 }
                 .tag(3)
         }

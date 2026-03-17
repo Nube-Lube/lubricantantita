@@ -109,7 +109,9 @@ class DownloadManager: NSObject, ObservableObject {
         var req = URLRequest(url: endpoint, timeoutInterval: 300)
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-        let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+        let session = ServerManager.shared.base.hasPrefix("https")
+            ? ServerManager.shared.localSession : URLSession.shared
+        let (bytes, resp) = try await session.bytes(for: req)
         guard (resp as? HTTPURLResponse)?.statusCode == 200
         else { throw dlErr("Server returned an error — check server console") }
 
@@ -202,7 +204,9 @@ class DownloadManager: NSObject, ObservableObject {
             return
         }
 
-        let (tmp, _) = try await URLSession.shared.download(from: url)
+        let session = serverBase.hasPrefix("https")
+            ? ServerManager.shared.localSession : URLSession.shared
+        let (tmp, _) = try await session.download(from: url)
         try FileManager.default.moveItem(at: tmp, to: dest)
 
         LibraryManager.shared.add(Track(
