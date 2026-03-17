@@ -17,8 +17,6 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
 
       - name: Install XcodeGen
-        # Pin to 2.36.1 — newer XcodeGen versions write objectVersion=77
-        # which Xcode 15.4 rejects as a "future Xcode project file format".
         run: |
           brew install mint
           mint install yonaskolb/XcodeGen@2.36.1
@@ -26,30 +24,50 @@ jobs:
       - name: Generate Xcode project
         run: mint run yonaskolb/XcodeGen@2.36.1 xcodegen generate --spec project.yml
 
-      - name: Build app (unsigned)
+      - name: Archive app
         run: |
-          xcodebuild \
+          xcodebuild archive \
             -project lubricantante.xcodeproj \
             -scheme lubricantante \
             -configuration Release \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath ${{ github.workspace }}/build \
+            -archivePath ${{ github.workspace }}/lubricantante.xcarchive \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            ONLY_ACTIVE_ARCH=NO
+            CODE_SIGNING_ALLOWED=NO
 
-      - name: Find .app
-        run: find ${{ github.workspace }}/build -name "*.app" -type d
-
-      - name: Package IPA
+      - name: Package IPA with Swift libraries
         run: |
-          APP_PATH=$(find ${{ github.workspace }}/build -name "*.app" -type d | head -1)
-          echo "Found: $APP_PATH"
+          # Find the .app in the archive
+          APP_PATH="${{ github.workspace }}/lubricantante.xcarchive/Products/Applications/lubricantante.app"
+          echo "App path: $APP_PATH"
+          ls -lh "$APP_PATH"
+          
+          # Create Frameworks directory if it doesn't exist
+          mkdir -p "$APP_PATH/Frameworks"
+          
+          # Copy Swift standard libraries
+          SWIFT_LIB_PATH="/Applications/Xcode_15.4.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos"
+          
+          for lib in libswiftCore.dylib libswiftFoundation.dylib libswiftObjectiveC.dylib libswiftSwiftOnoneSupport.dylib libswiftDispatch.dylib libswift_Concurrency.dylib libswiftCoreFoundation.dylib libswift_StringProcessing.dylib libswiftUIKit.dylib libswiftDarwin.dylib libswiftCoreGraphics.dylib libswiftMetal.dylib libswiftQuartzCore.dylib libswiftAVFAudio.dylib libswiftAVFoundation.dylib libswiftMediaPlayer.dylib libswiftCoreAudio.dylib; do
+            if [ -f "$SWIFT_LIB_PATH/$lib" ]; then
+              cp "$SWIFT_LIB_PATH/$lib" "$APP_PATH/Frameworks/"
+              echo "✓ Copied $lib"
+            fi
+          done
+          
+          echo ""
+          echo "Frameworks directory contents:"
+          ls -lh "$APP_PATH/Frameworks/"
+          
+          # Create IPA
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/lubricantante.app
           zip -r lubricantante.ipa Payload
+          
+          echo ""
+          echo "Final IPA:"
           ls -lh lubricantante.ipa
+          unzip -l lubricantante.ipa | head -20
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
