@@ -1,5 +1,5 @@
 import Foundation
-import AVFoundation
+import Combine
 
 // MARK: - Download Status
 enum DLStatus {
@@ -17,324 +17,350 @@ struct DLItem: Identifiable {
     var message: String
 }
 
+// MARK: - YouTube Client Config
+struct YTClientConfig {
+    var clientName:        String = "ANDROID"
+    var clientVersion:     String = "19.09.37"
+    var androidSdkVersion: Int    = 30
+    var userAgent:         String = "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"
+}
+
 // MARK: - Download Manager
 @MainActor
 class DownloadManager: ObservableObject {
     static let shared = DownloadManager()
-    
+
     @Published var items: [DLItem] = []
     @Published var isDownloading = false
-    
-    private var activeDownloads = 0
-    private let maxConcurrent = 3
-    
-    // YouTube config cache
-    private var cachedConfig: [String: Any]?
-    private var configLastFetched: Date?
-    private let configCacheLifetime: TimeInterval = 3600 // 1 hour
-    
+
+    private let docs = FileManager.default.urls(
+        for: .documentDirectory, in: .userDomainMask)[0]
+
+    // Self-updating client config — fetched from yt-dlp source
+    private var cachedConfig: YTClientConfig?
+    private var configFetchedAt: Date?
+    private let configTTL: TimeInterval = 86400 // 24 hours
+
+    // yt-dlp's youtube.py always has the current working client params
+    private let ytdlpSourceURL = URL(string:
+        "https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/yt_dlp/extractor/youtube.py")!
+
     private init() {}
-    
+
     // MARK: - Public API
-    
+
     func start(urlString: String) {
+        guard !isDownloading else { return }
+        isDownloading = true
+        items.removeAll()
+
         Task {
-            if urlString.contains("list=") {
-                await downloadPlaylist(url: urlString)
-            } else {
-                await downloadSingleVideo(url: urlString)
+            do {
+                if let listId = extractPlaylistId(from: urlString),
+                   !urlString.contains("watch?v=") {
+                    try await downloadPlaylist(listId: listId)
+                } else if let videoId = extractVideoId(from: urlString) {
+                    try await downloadVideo(videoId: videoId, album: "YouTube")
+                } else {
+                    addItem("Error", status: .error, message: "Could not find a video or playlist ID in that URL")
+                }
+            } catch {
+                addItem("Error", status: .error, message: error.localizedDescription)
             }
+            isDownloading = false
+            await LibraryManager.shared.reload()
         }
     }
-    
-    private func downloadPlaylist(url: String) async {
-        guard !isDownloading else { return }
-        isDownloading = true
-        items.removeAll()
-        
+
+    // MARK: - Self-updating client config
+
+    private func fetchClientConfig() async -> YTClientConfig {
+        // Return cached config if still fresh
+        if let cfg = cachedConfig,
+           let at = configFetchedAt,
+           Date().timeIntervalSince(at) < configTTL {
+            return cfg
+        }
+
+        // Try persisted config from UserDefaults first (works offline)
+        if let saved = UserDefaults.standard.dictionary(forKey: "yt_client_config"),
+           let name = saved["clientName"]    as? String,
+           let ver  = saved["clientVersion"] as? String,
+           let sdk  = saved["androidSdk"]   as? Int,
+           let ua   = saved["userAgent"]    as? String {
+            let cfg = YTClientConfig(clientName: name, clientVersion: ver,
+                                     androidSdkVersion: sdk, userAgent: ua)
+            cachedConfig    = cfg
+            configFetchedAt = Date().addingTimeInterval(-configTTL + 3600)
+        }
+
+        // Fetch fresh config from yt-dlp source
         do {
-            let videoIDs = try await extractVideoIDs(from: url)
-            
-            for id in videoIDs {
-                items.append(DLItem(
-                    title: id,
-                    status: .pending,
-                    message: "Queued"
-                ))
+            let (data, _) = try await URLSession.shared.data(from: ytdlpSourceURL)
+            if let source = String(data: data, encoding: .utf8) {
+                let config = parseYTDLPSource(source)
+                cachedConfig    = config
+                configFetchedAt = Date()
+                UserDefaults.standard.set([
+                    "clientName":    config.clientName,
+                    "clientVersion": config.clientVersion,
+                    "androidSdk":    config.androidSdkVersion,
+                    "userAgent":     config.userAgent,
+                ], forKey: "yt_client_config")
+                return config
             }
-            
-            // Download with concurrency limit
-            await withTaskGroup(of: Void.self) { group in
-                for id in videoIDs {
-                    // Wait if we're at max concurrent downloads
-                    while activeDownloads >= maxConcurrent {
-                        try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
-                    }
-                    
-                    group.addTask {
-                        await self.downloadVideo(id: id)
-                    }
+        } catch {
+            // Network failed — use cached or hardcoded fallback
+        }
+
+        return cachedConfig ?? YTClientConfig()
+    }
+
+    private func parseYTDLPSource(_ source: String) -> YTClientConfig {
+        var config = YTClientConfig()
+        let lines = source.components(separatedBy: "\n")
+        var inAndroidBlock = false
+        var braceDepth = 0
+
+        for line in lines {
+            let t = line.trimmingCharacters(in: .whitespaces)
+
+            if !inAndroidBlock && t.contains("'ANDROID'") && t.contains("{") {
+                inAndroidBlock = true; braceDepth = 1; continue
+            }
+
+            if inAndroidBlock {
+                braceDepth += t.filter { $0 == "{" }.count
+                braceDepth -= t.filter { $0 == "}" }.count
+                if braceDepth <= 0 { inAndroidBlock = false; continue }
+
+                if t.contains("'clientVersion'"),
+                   let v = extractStringValue(from: t) {
+                    config.clientVersion = v
+                    config.userAgent = "com.google.android.youtube/\(v) (Linux; U; Android 11) gzip"
+                }
+                if t.contains("androidSdkVersion"),
+                   let sdk = extractIntValue(from: t) {
+                    config.androidSdkVersion = sdk
                 }
             }
-            
-        } catch {
-            print("Playlist extraction failed: \(error)")
         }
-        
-        isDownloading = false
+        return config
     }
-    
-    private func downloadSingleVideo(url: String) async {
-        guard !isDownloading else { return }
-        isDownloading = true
-        items.removeAll()
-        
-        if let id = extractVideoID(from: url) {
-            items.append(DLItem(
-                title: id,
-                status: .pending,
-                message: "Queued"
-            ))
-            await downloadVideo(id: id)
+
+    private func extractStringValue(from line: String) -> String? {
+        guard let r = line.range(of: "'([0-9]+\\.[0-9]+\\.[0-9]+)'",
+                                  options: .regularExpression),
+              let vr = line[r].range(of: "[0-9]+\\.[0-9]+\\.[0-9]+",
+                                     options: .regularExpression)
+        else { return nil }
+        return String(line[r][vr])
+    }
+
+    private func extractIntValue(from line: String) -> Int? {
+        guard let r = line.range(of: ":\\s*(\\d+)", options: .regularExpression),
+              let nr = line[r].range(of: "\\d+", options: .regularExpression)
+        else { return nil }
+        return Int(line[r][nr])
+    }
+
+    // MARK: - Playlist (InnerTube browse API)
+
+    private func downloadPlaylist(listId: String) async throws {
+        addItem("Playlist", status: .downloading, message: "Fetching playlist…")
+
+        let browseURL = URL(string:
+            "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false")!
+        var req = URLRequest(url: browseURL)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "browseId": "VL\(listId)",
+            "context": [
+                "client": ["clientName": "WEB", "clientVersion": "2.20231121.08.00"]
+            ]
+        ])
+
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let json = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any] else {
+            throw ytErr("Could not parse playlist response")
         }
-        
-        isDownloading = false
+
+        // Extract playlist name
+        var playlistName = "YouTube Playlist"
+        if let h = json["header"] as? [String: Any],
+           let r = h["playlistHeaderRenderer"] as? [String: Any],
+           let t = r["title"] as? [String: Any],
+           let runs = t["runs"] as? [[String: Any]],
+           let text = runs.first?["text"] as? String {
+            playlistName = text
+        } else if let m = json["metadata"] as? [String: Any],
+                  let r = m["playlistMetadataRenderer"] as? [String: Any],
+                  let t = r["title"] as? String {
+            playlistName = t
+        }
+
+        // Extract video IDs
+        var videoIds: [String] = []
+        extractVideoIds(from: json, into: &videoIds)
+
+        guard !videoIds.isEmpty else {
+            throw ytErr("No videos found in playlist — it may be private or empty")
+        }
+
+        updateItem("Playlist", status: .pending,
+                   message: "\(playlistName) — \(videoIds.count) tracks")
+
+        for videoId in videoIds {
+            try await downloadVideo(videoId: videoId, album: playlistName)
+        }
     }
-    
-    // MARK: - Video ID Extraction
-    
-    private func extractVideoIDs(from url: String) async throws -> [String] {
-        // Try playlist first
-        if let playlistID = url.range(of: "list=")?.upperBound {
-            let idEnd = url[playlistID...].firstIndex(of: "&") ?? url.endIndex
-            let listID = String(url[playlistID..<idEnd])
-            
-            let playlistURL = "https://www.youtube.com/playlist?list=\(listID)"
-            let (data, _) = try await URLSession.shared.data(from: URL(string: playlistURL)!)
-            
-            guard let html = String(data: data, encoding: .utf8) else {
-                throw NSError(domain: "YouTube", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid response"])
+
+    private func extractVideoIds(from obj: Any, into ids: inout [String]) {
+        if let dict = obj as? [String: Any] {
+            if let r = dict["playlistVideoRenderer"] as? [String: Any],
+               let vid = r["videoId"] as? String,
+               !ids.contains(vid) {
+                ids.append(vid)
             }
-            
-            var videoIDs: [String] = []
-            let pattern = #"\"videoId\":\"([a-zA-Z0-9_-]{11})\""#
-            let regex = try NSRegularExpression(pattern: pattern)
-            let matches = regex.matches(in: html, range: NSRange(html.startIndex..., in: html))
-            
-            for match in matches {
-                if let range = Range(match.range(at: 1), in: html) {
-                    let id = String(html[range])
-                    if !videoIDs.contains(id) {
-                        videoIDs.append(id)
-                    }
-                }
-            }
-            
-            return videoIDs
-        }
-        
-        // Single video
-        if let id = extractVideoID(from: url) {
-            return [id]
-        }
-        
-        throw NSError(domain: "YouTube", code: 2, userInfo: [NSLocalizedDescriptionKey: "No videos found"])
-    }
-    
-    private func extractVideoID(from url: String) -> String? {
-        let patterns = [
-            #"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})"#,
-            #"^([a-zA-Z0-9_-]{11})$"#
-        ]
-        
-        for pattern in patterns {
-            if let regex = try? NSRegularExpression(pattern: pattern),
-               let match = regex.firstMatch(in: url, range: NSRange(url.startIndex..., in: url)),
-               let range = Range(match.range(at: 1), in: url) {
-                return String(url[range])
-            }
-        }
-        return nil
-    }
-    
-    // MARK: - Download Logic
-    
-    private func downloadVideo(id: String) async {
-        activeDownloads += 1
-        defer { activeDownloads -= 1 }
-        
-        do {
-            // Get video info
-            updateItem(id, status: .downloading, message: "Fetching info…")
-            
-            let info = try await fetchVideoInfo(id: id)
-            guard let title = info["title"] as? String,
-                  let streamURL = info["url"] as? String else {
-                updateItem(id, status: .error, message: "Missing data")
-                return
-            }
-            
-            // Sanitize filename
-            let safeTitle = title.replacingOccurrences(of: "[^a-zA-Z0-9 .-]", with: "", options: .regularExpression)
-            
-            // Download audio
-            let key = id
-            updateItem(key, newTitle: title, status: .downloading, message: "Downloading…")
-            
-            try await downloadAudio(from: streamURL, title: safeTitle)
-            updateItem(title, status: .done, message: "Saved ✓")
-            
-        } catch {
-            updateItem(id, status: .error, message: error.localizedDescription)
+            dict.values.forEach { extractVideoIds(from: $0, into: &ids) }
+        } else if let arr = obj as? [Any] {
+            arr.forEach { extractVideoIds(from: $0, into: &ids) }
         }
     }
-    
-    private func fetchVideoInfo(id: String) async throws -> [String: Any] {
-        // Get config
-        let config = try await getYouTubeConfig()
-        
-        guard let key = config["INNERTUBE_API_KEY"] as? String,
-              let context = config["INNERTUBE_CONTEXT"] as? [String: Any] else {
-            throw NSError(domain: "YouTube", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid config"])
+
+    // MARK: - Single video (InnerTube player API)
+
+    private func downloadVideo(videoId: String, album: String) async throws {
+        let key = "vid_\(videoId)"
+        addItem(key, status: .downloading, message: "Fetching stream…")
+
+        let config = await fetchClientConfig()
+
+        let playerURL = URL(string:
+            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
+        var req = URLRequest(url: playerURL)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(config.userAgent, forHTTPHeaderField: "User-Agent")
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "videoId": videoId,
+            "context": [
+                "client": [
+                    "clientName":        config.clientName,
+                    "clientVersion":     config.clientVersion,
+                    "androidSdkVersion": config.androidSdkVersion,
+                    "userAgent":         config.userAgent,
+                ]
+            ]
+        ])
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw ytErr("Server returned \((resp as? HTTPURLResponse)?.statusCode ?? 0)")
         }
-        
-        // Build request
-        var request = URLRequest(url: URL(string: "https://www.youtube.com/youtubei/v1/player?key=\(key)")!)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        let body: [String: Any] = [
-            "videoId": id,
-            "context": context
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
-        let (data, _) = try await URLSession.shared.data(for: request)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw NSError(domain: "YouTube", code: 4, userInfo: [NSLocalizedDescriptionKey: "Invalid JSON"])
+
+        guard let json = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any] else {
+            throw ytErr("Bad JSON response")
         }
-        
-        // Extract title
-        let details = (json["videoDetails"] as? [String: Any]) ?? [:]
-        let title = details["title"] as? String ?? "Unknown"
-        
-        // Extract stream URL
-        guard let streamingData = json["streamingData"] as? [String: Any],
-              let formats = streamingData["adaptiveFormats"] as? [[String: Any]] else {
-            throw NSError(domain: "YouTube", code: 5, userInfo: [NSLocalizedDescriptionKey: "No streams found"])
+
+        if let ps = json["playabilityStatus"] as? [String: Any],
+           (ps["status"] as? String) != "OK" {
+            throw ytErr(ps["reason"] as? String ?? "Video unavailable")
         }
-        
+
+        let title = (json["videoDetails"] as? [String: Any])?["title"]
+                    as? String ?? "YouTube Track"
+
+        let formats = (json["streamingData"] as? [String: Any])?
+            ["adaptiveFormats"] as? [[String: Any]] ?? []
+
         let audioOnly = formats
             .filter { ($0["mimeType"] as? String)?.hasPrefix("audio") == true
                       && $0["url"] is String }
             .sorted { ($0["bitrate"] as? Int ?? 0) > ($1["bitrate"] as? Int ?? 0) }
-        
-        guard let best = audioOnly.first,
-              let url = best["url"] as? String else {
-            throw NSError(domain: "YouTube", code: 6, userInfo: [NSLocalizedDescriptionKey: "No audio stream"])
+
+        guard let best   = audioOnly.first,
+              let urlStr = best["url"] as? String,
+              let audioURL = URL(string: urlStr) else {
+            throw ytErr("No audio stream found for: \(title)")
         }
-        
-        return ["title": title, "url": url]
+
+        let mime = (best["mimeType"] as? String)?
+            .components(separatedBy: ";").first ?? "audio/mp4"
+        let ext  = mime.contains("webm") || mime.contains("opus") ? "webm" : "m4a"
+
+        updateItem(key, newTitle: title, status: .downloading,
+                   message: "Downloading…")
+
+        // Download to temp then move to Documents
+        let (tmpURL, _) = try await URLSession.shared.download(from: audioURL)
+        let safe     = sanitize(title)
+        let albumDir = docs.appendingPathComponent(sanitize(album))
+        try? FileManager.default.createDirectory(
+            at: albumDir, withIntermediateDirectories: true)
+        let dest = albumDir.appendingPathComponent("\(safe).\(ext)")
+        try? FileManager.default.removeItem(at: dest)
+        try  FileManager.default.moveItem(at: tmpURL, to: dest)
+
+        let track = Track(
+            id:       UUID(),
+            name:     title,
+            album:    album,
+            filename: "\(sanitize(album))/\(safe).\(ext)",
+            addedAt:  Date()
+        )
+        LibraryManager.shared.add(track)
+        updateItem(title, status: .done, message: "Saved ✓")
     }
-    
-    private func getYouTubeConfig() async throws -> [String: Any] {
-        // Return cached if still valid
-        if let cached = cachedConfig,
-           let lastFetch = configLastFetched,
-           Date().timeIntervalSince(lastFetch) < configCacheLifetime {
-            return cached
-        }
-        
-        // Fetch fresh config
-        let url = URL(string: "https://www.youtube.com/")!
-        let (data, _) = try await URLSession.shared.data(from: url)
-        guard let html = String(data: data, encoding: .utf8) else {
-            throw NSError(domain: "YouTube", code: 7, userInfo: [NSLocalizedDescriptionKey: "Invalid HTML"])
-        }
-        
-        // Extract INNERTUBE_API_KEY
-        guard let keyRange = html.range(of: #"\"INNERTUBE_API_KEY\":\"([^\"]+)\""#, options: .regularExpression),
-              let keyMatch = try? NSRegularExpression(pattern: #"\"INNERTUBE_API_KEY\":\"([^\"]+)\""#)
-                .firstMatch(in: html, range: NSRange(keyRange, in: html)),
-              let keyValueRange = Range(keyMatch.range(at: 1), in: html) else {
-            throw NSError(domain: "YouTube", code: 8, userInfo: [NSLocalizedDescriptionKey: "API key not found"])
-        }
-        let apiKey = String(html[keyValueRange])
-        
-        // Extract INNERTUBE_CONTEXT
-        guard let _ = html.range(of: #"\"INNERTUBE_CONTEXT\":(\{[^}]+\})"#, options: .regularExpression),
-              let contextMatch = try? NSRegularExpression(pattern: #"\"INNERTUBE_CONTEXT\":(\{.+?\})\s*,\s*\"INNERTUBE"#)
-                .firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
-              let contextValueRange = Range(contextMatch.range(at: 1), in: html) else {
-            throw NSError(domain: "YouTube", code: 9, userInfo: [NSLocalizedDescriptionKey: "Context not found"])
-        }
-        
-        let contextJSON = String(html[contextValueRange])
-        guard let contextData = contextJSON.data(using: .utf8),
-              let context = try? JSONSerialization.jsonObject(with: contextData) as? [String: Any] else {
-            throw NSError(domain: "YouTube", code: 10, userInfo: [NSLocalizedDescriptionKey: "Invalid context"])
-        }
-        
-        let config = [
-            "INNERTUBE_API_KEY": apiKey,
-            "INNERTUBE_CONTEXT": context
-        ] as [String: Any]
-        
-        // Cache it
-        cachedConfig = config
-        configLastFetched = Date()
-        
-        return config
+
+    // MARK: - Utilities
+
+    private func ytErr(_ msg: String) -> NSError {
+        NSError(domain: "YouTube", code: 0,
+                userInfo: [NSLocalizedDescriptionKey: msg])
     }
-    
-    private func downloadAudio(from urlString: String, title: String) async throws {
-        let url = URL(string: urlString)!
-        let (tempURL, _) = try await URLSession.shared.download(from: url)
-        
-        // Determine format
-        let ext: String
-        if urlString.contains("mime=audio%2Fwebm") || urlString.contains("mime=audio/webm") {
-            ext = "webm"
-        } else if urlString.contains("mime=audio%2Fmp4") || urlString.contains("mime=audio/mp4") {
-            ext = "m4a"
-        } else {
-            ext = "m4a" // default
-        }
-        
-        // Get documents directory and create Songs folder
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let songsDir = docs.appendingPathComponent("Songs")
-        
-        // Create directory if needed
-        try? FileManager.default.createDirectory(at: songsDir, withIntermediateDirectories: true)
-        
-        // Save to library
-        let destURL = songsDir.appendingPathComponent("\(title).\(ext)")
-        
-        if FileManager.default.fileExists(atPath: destURL.path) {
-            try? FileManager.default.removeItem(at: destURL)
-        }
-        
-        try FileManager.default.moveItem(at: tempURL, to: destURL)
-        
-        // Trigger library reload
-        await LibraryManager.shared.reload()
+
+    private func sanitize(_ s: String) -> String {
+        s.replacingOccurrences(of: "[/\\\\:*?\"<>|]",
+                               with: "_", options: .regularExpression)
+         .trimmingCharacters(in: .whitespaces)
     }
-    
-    // MARK: - UI Updates
-    
+
+    private func extractVideoId(from url: String) -> String? {
+        guard let r  = url.range(of: "(?:v=|youtu\\.be/|/embed/)([A-Za-z0-9_-]{11})",
+                                  options: .regularExpression),
+              let vr = url[r].range(of: "[A-Za-z0-9_-]{11}",
+                                    options: .regularExpression)
+        else { return nil }
+        return String(url[r][vr])
+    }
+
+    private func extractPlaylistId(from url: String) -> String? {
+        guard let r = url.range(of: "[?&]list=([A-Za-z0-9_-]+)",
+                                 options: .regularExpression)
+        else { return nil }
+        return String(url[r])
+            .components(separatedBy: "list=").last?
+            .components(separatedBy: "&").first
+    }
+
+    // MARK: - UI helpers
+
+    private func addItem(_ title: String, status: DLStatus, message: String) {
+        items.append(DLItem(title: title, status: status, message: message))
+    }
+
     private func updateItem(_ title: String,
-                          newTitle: String? = nil,
-                          status: DLStatus? = nil,
-                          message: String) {
-        if let idx = items.firstIndex(where: { $0.title == title }) {
-            if let newTitle = newTitle {
-                items[idx].title = newTitle
-            }
-            if let status = status {
-                items[idx].status = status
-            }
-            items[idx].message = message
-        }
+                            newTitle: String? = nil,
+                            status: DLStatus,
+                            message: String) {
+        guard let i = items.firstIndex(where: { $0.title == title })
+        else { return }
+        items[i].status  = status
+        items[i].message = message
+        if let t = newTitle { items[i].title = t }
     }
 }
