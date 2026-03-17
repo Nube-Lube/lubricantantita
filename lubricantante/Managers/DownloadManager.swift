@@ -125,8 +125,10 @@ class DownloadManager: NSObject, ObservableObject {
 
         let stream = try await withCheckedThrowingContinuation { cont in
             pendingContinuations[videoId] = cont
-            // Load mobile YouTube — it populates ytInitialPlayerResponse synchronously
-            let url = URL(string: "https://m.youtube.com/watch?v=\(videoId)&bpctr=9999999999&has_verified=1")!
+
+            // Embed page reliably includes ytInitialPlayerResponse with stream URLs
+            // It bypasses login walls and serves streams directly
+            let url = URL(string: "https://www.youtube.com/embed/\(videoId)?autoplay=0&hl=en")!
             var req = URLRequest(url: url)
             req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
                          forHTTPHeaderField: "User-Agent")
@@ -163,39 +165,61 @@ class DownloadManager: NSObject, ObservableObject {
     }
 
     // ── Called by WKNavigationDelegate after page finishes loading ────────
-    func extractStreamFromPage(videoId: String) {
+    func extractStreamFromPage(videoId: String, attempt: Int = 0) {
         let js = """
         (function() {
-            // Try ytInitialPlayerResponse first (set synchronously on page load)
-            var data = window.ytInitialPlayerResponse;
+            var data = null;
 
-            // Fallback: search inline scripts for the JSON
+            // Embed page uses yt.playerConfig
+            if (window.yt && window.yt.playerConfig) {
+                var args = window.yt.playerConfig.args || {};
+                if (args.player_response) {
+                    try { data = JSON.parse(args.player_response); } catch(e) {}
+                }
+            }
+
+            // Full page uses ytInitialPlayerResponse
+            if (!data) data = window.ytInitialPlayerResponse;
+
+            // Search inline scripts as fallback
             if (!data) {
                 var scripts = document.querySelectorAll('script');
                 for (var i = 0; i < scripts.length; i++) {
                     var t = scripts[i].textContent;
-                    var idx = t.indexOf('ytInitialPlayerResponse');
+                    // Try player_response first (embed pages)
+                    var idx = t.indexOf('"player_response"');
+                    if (idx >= 0) {
+                        try {
+                            var q = t.indexOf('"', idx + 18) + 1;
+                            var end = t.indexOf('"}', q);
+                            var raw = t.substring(q, end + 2).replace(/\\\\/g,'\\\\').replace(/\\\\"/g,'"');
+                            data = JSON.parse(raw);
+                            if (data && data.streamingData) break;
+                        } catch(e) {}
+                    }
+                    // Try ytInitialPlayerResponse
+                    idx = t.indexOf('ytInitialPlayerResponse');
                     if (idx >= 0) {
                         try {
                             var start = t.indexOf('{', idx);
-                            // Find matching closing brace
                             var depth = 0, end = start;
                             for (; end < Math.min(t.length, start + 500000); end++) {
                                 if (t[end] === '{') depth++;
                                 else if (t[end] === '}') { depth--; if (depth === 0) break; }
                             }
                             data = JSON.parse(t.substring(start, end + 1));
-                            break;
+                            if (data && data.streamingData) break;
                         } catch(e) {}
                     }
                 }
             }
 
-            if (!data) return JSON.stringify({error: 'ytInitialPlayerResponse not found'});
+            if (!data) return JSON.stringify({error: 'not_ready'});
 
-            var title = (data.videoDetails || {}).title || 'YouTube Track';
-            var formats = (data.streamingData || {}).adaptiveFormats || [];
-            var audio = formats
+            var title   = (data.videoDetails || {}).title || 'YouTube Track';
+            var sd      = data.streamingData || {};
+            var formats = (sd.adaptiveFormats || []).concat(sd.formats || []);
+            var audio   = formats
                 .filter(function(f){ return f.mimeType && f.mimeType.indexOf('audio') === 0 && f.url; })
                 .sort(function(a,b){ return (b.bitrate||0)-(a.bitrate||0); });
 
@@ -203,7 +227,7 @@ class DownloadManager: NSObject, ObservableObject {
                 return JSON.stringify({
                     error: 'No audio streams. Status: ' +
                         ((data.playabilityStatus||{}).status||'unknown') +
-                        ' Reason: ' + ((data.playabilityStatus||{}).reason||'none')
+                        ' Formats total: ' + formats.length
                 });
             }
 
@@ -229,7 +253,14 @@ class DownloadManager: NSObject, ObservableObject {
                     return
                 }
 
+                // If not ready yet, retry up to 6 times with 2s delay (12s total)
                 if let errMsg = json["error"] as? String {
+                    if errMsg == "not_ready" && attempt < 6 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                            self.extractStreamFromPage(videoId: videoId, attempt: attempt + 1)
+                        }
+                        return
+                    }
                     if let c = self.pendingContinuations.removeValue(forKey: videoId) {
                         c.resume(throwing: self.dlErr(errMsg))
                     }
@@ -344,11 +375,22 @@ class WeakScriptHandler: NSObject, WKScriptMessageHandler {
 // ── WKNavigationDelegate ──────────────────────────────────────────────────────
 extension DownloadManager: WKNavigationDelegate {
     nonisolated func webView(_ wv: WKWebView, didFinish nav: WKNavigation!) {
-        guard let urlStr = wv.url?.absoluteString,
-              let videoId = urlStr.components(separatedBy: "v=").last?
-                                   .components(separatedBy: "&").first,
-              videoId.count == 11 else { return }
-        Task { @MainActor in self.extractStreamFromPage(videoId: videoId) }
+        guard let urlStr = wv.url?.absoluteString else { return }
+
+        // Extract video ID from embed URL: youtube.com/embed/VIDEO_ID
+        let videoId: String?
+        if urlStr.contains("/embed/") {
+            videoId = urlStr.components(separatedBy: "/embed/").last?
+                            .components(separatedBy: "?").first
+        } else {
+            videoId = urlStr.components(separatedBy: "v=").last?
+                            .components(separatedBy: "&").first
+        }
+
+        guard let vid = videoId, vid.count == 11 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            self.extractStreamFromPage(videoId: vid, attempt: 0)
+        }
     }
 
     nonisolated func webView(_ wv: WKWebView, didFail nav: WKNavigation!,
