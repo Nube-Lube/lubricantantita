@@ -355,6 +355,7 @@ class DownloadManager: ObservableObject {
     private func fetchVisitorData() async throws -> String {
         var req = URLRequest(url: URL(string:
             "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")!)
+        req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = 10
         req.httpBody = try JSONSerialization.data(withJSONObject: [
