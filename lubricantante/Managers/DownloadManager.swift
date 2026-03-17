@@ -236,27 +236,54 @@ class DownloadManager: ObservableObject {
         let key = "vid_\(videoId)"
         addItem(key, status: .downloading, message: "Fetching stream…")
 
-        let config = await fetchClientConfig()
-
+        // iOS client is more reliable than ANDROID for direct API calls
+        // It doesn't require an API key and returns pre-signed stream URLs
         let playerURL = URL(string:
             "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
         var req = URLRequest(url: playerURL)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(config.userAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+                     forHTTPHeaderField: "User-Agent")
+        req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        req.timeoutInterval = 30
         req.httpBody = try JSONSerialization.data(withJSONObject: [
             "videoId": videoId,
             "context": [
                 "client": [
-                    "clientName":        config.clientName,
-                    "clientVersion":     config.clientVersion,
-                    "androidSdkVersion": config.androidSdkVersion,
-                    "userAgent":         config.userAgent,
+                    "clientName":    "IOS",
+                    "clientVersion": "19.29.1",
+                    "deviceModel":   "iPhone16,2",
+                    "userAgent":     "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+                    "hl":            "en",
+                    "gl":            "US",
                 ]
             ]
         ])
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        var data: Data
+        var resp: URLResponse
+        (data, resp) = try await URLSession.shared.data(for: req)
+
+        // If iOS client gets 400, try TVHTML5 client as fallback
+        if (resp as? HTTPURLResponse)?.statusCode == 400 {
+            var req2 = URLRequest(url: playerURL)
+            req2.httpMethod = "POST"
+            req2.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req2.timeoutInterval = 30
+            req2.httpBody = try JSONSerialization.data(withJSONObject: [
+                "videoId": videoId,
+                "context": [
+                    "client": [
+                        "clientName":    "TVHTML5",
+                        "clientVersion": "7.20230405.08.00",
+                        "hl": "en", "gl": "US",
+                    ]
+                ]
+            ])
+            (data, resp) = try await URLSession.shared.data(for: req2)
+        }
+
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
             throw ytErr("Server returned \((resp as? HTTPURLResponse)?.statusCode ?? 0)")
         }
