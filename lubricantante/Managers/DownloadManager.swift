@@ -48,76 +48,84 @@ class DownloadManager: NSObject, ObservableObject, WKScriptMessageHandler {
     // ── WebView setup ─────────────────────────────────────────────────────
     private func setupWebView() {
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = WKWebsiteDataStore.default() // shares cookies with login
+        config.websiteDataStore = WKWebsiteDataStore.default()
+        config.mediaTypesRequiringUserActionForPlayback = []
 
-        // Script to intercept YouTube's fetch calls to the player API
         let interceptScript = WKUserScript(source: """
         (function() {
-            const originalFetch = window.fetch;
+            function tryExtract(data) {
+                try {
+                    const videoId = data?.videoDetails?.videoId;
+                    const title   = data?.videoDetails?.title || 'YouTube Track';
+                    const formats = data?.streamingData?.adaptiveFormats || [];
+                    const audio   = formats
+                        .filter(f => f.mimeType && f.mimeType.startsWith('audio') && f.url)
+                        .sort((a,b) => (b.bitrate||0)-(a.bitrate||0));
+                    if (audio.length > 0 && videoId) {
+                        window.webkit.messageHandlers.streamIntercepted.postMessage({
+                            videoId:  videoId,
+                            title:    title,
+                            url:      audio[0].url,
+                            mimeType: audio[0].mimeType.split(';')[0]
+                        });
+                        return true;
+                    }
+                } catch(e) {}
+                return false;
+            }
+
+            // Intercept fetch
+            const origFetch = window.fetch;
             window.fetch = async function(...args) {
-                const response = await originalFetch(...args);
-                const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+                const res = await origFetch(...args);
+                const url = (typeof args[0]==='string' ? args[0] : args[0]?.url) || '';
                 if (url.includes('/youtubei/v1/player')) {
-                    const clone = response.clone();
-                    clone.json().then(data => {
-                        const videoId = data?.videoDetails?.videoId;
-                        const title   = data?.videoDetails?.title || 'YouTube Track';
-                        const formats = data?.streamingData?.adaptiveFormats || [];
-                        const audio   = formats.filter(f =>
-                            f.mimeType && f.mimeType.startsWith('audio') && f.url
-                        ).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-                        if (audio.length > 0 && videoId) {
-                            window.webkit.messageHandlers.streamIntercepted.postMessage({
-                                videoId:  videoId,
-                                title:    title,
-                                url:      audio[0].url,
-                                mimeType: audio[0].mimeType.split(';')[0]
-                            });
-                        }
-                    }).catch(() => {});
+                    res.clone().json().then(tryExtract).catch(()=>{});
                 }
-                return response;
+                return res;
             };
 
-            // Also intercept XMLHttpRequest for older YouTube code paths
+            // Intercept XHR
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-                this._url = url;
-                return origOpen.call(this, method, url, ...rest);
-            };
-            XMLHttpRequest.prototype.send = function(body) {
-                if (this._url && this._url.includes('/youtubei/v1/player')) {
-                    this.addEventListener('load', function() {
-                        try {
-                            const data = JSON.parse(this.responseText);
-                            const videoId = data?.videoDetails?.videoId;
-                            const title   = data?.videoDetails?.title || 'YouTube Track';
-                            const formats = data?.streamingData?.adaptiveFormats || [];
-                            const audio   = formats.filter(f =>
-                                f.mimeType && f.mimeType.startsWith('audio') && f.url
-                            ).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-                            if (audio.length > 0 && videoId) {
-                                window.webkit.messageHandlers.streamIntercepted.postMessage({
-                                    videoId:  videoId,
-                                    title:    title,
-                                    url:      audio[0].url,
-                                    mimeType: audio[0].mimeType.split(';')[0]
-                                });
-                            }
-                        } catch(e) {}
+            XMLHttpRequest.prototype.open = function(m,u,...r){this._u=u;return origOpen.call(this,m,u,...r);};
+            XMLHttpRequest.prototype.send = function(b){
+                if(this._u && this._u.includes('/youtubei/v1/player')){
+                    this.addEventListener('load',function(){
+                        try{tryExtract(JSON.parse(this.responseText));}catch(e){}
                     });
                 }
-                return origSend.call(this, body);
+                return origSend.call(this,b);
             };
+
+            // Also poll ytInitialPlayerResponse which is set synchronously
+            let attempts = 0;
+            const poll = setInterval(function() {
+                if(window.ytInitialPlayerResponse){
+                    if(tryExtract(window.ytInitialPlayerResponse)) clearInterval(poll);
+                }
+                if(++attempts > 20) clearInterval(poll);
+            }, 500);
         })();
         """, injectionTime: .atDocumentStart, forMainFrameOnly: false)
 
         config.userContentController.add(self, name: "streamIntercepted")
         config.userContentController.addUserScript(interceptScript)
 
-        let wv = WKWebView(frame: .zero, configuration: config)
+        let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1),
+                           configuration: config)
         wv.navigationDelegate = self
+        wv.alpha = 0.001 // nearly invisible but attached and running
+
+        // Attach to key window so iOS executes JS properly
+        DispatchQueue.main.async {
+            if let window = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first?.windows.first {
+                window.addSubview(wv)
+            }
+        }
+
         self.webView = wv
     }
 
