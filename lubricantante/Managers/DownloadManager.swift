@@ -236,47 +236,46 @@ class DownloadManager: ObservableObject {
         let key = "vid_\(videoId)"
         addItem(key, status: .downloading, message: "Fetching stream…")
 
-        // Get auth headers and PO token
+        // ANDROID client returns streamingData without PO token requirements
+        // Requires X-Goog-Api-Key header with YouTube's Android API key
         let authHeaders = await AuthManager.shared.authHeaders()
-        let poToken = (try? await POTokenManager.shared.getToken(
-            for: videoId, visitorData: "")) ?? ""
 
         let playerURL = URL(string:
             "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
         var req = URLRequest(url: playerURL)
         req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15",
+        req.setValue("application/json",  forHTTPHeaderField: "Content-Type")
+        req.setValue("AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+                     forHTTPHeaderField: "X-Goog-Api-Key")
+        req.setValue("com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
                      forHTTPHeaderField: "User-Agent")
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
-        req.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
         req.timeoutInterval = 30
         for (k, v) in authHeaders { req.setValue(v, forHTTPHeaderField: k) }
-
-        var clientContext: [String: Any] = [
-            "clientName":    "WEB",
-            "clientVersion": "2.20231121.08.00",
-            "hl":            "en",
-            "gl":            "US",
-        ]
-        if !poToken.isEmpty {
-            clientContext["poToken"] = poToken
-        }
-
         req.httpBody = try JSONSerialization.data(withJSONObject: [
             "videoId": videoId,
-            "context": ["client": clientContext]
+            "context": [
+                "client": [
+                    "clientName":        "ANDROID",
+                    "clientVersion":     "19.09.37",
+                    "androidSdkVersion": 30,
+                    "userAgent":         "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+                    "hl": "en", "gl": "US",
+                ]
+            ]
         ])
 
         var data: Data
         var resp: URLResponse
         (data, resp) = try await URLSession.shared.data(for: req)
 
-        // Fallback to WEB client if embedded player gets 400
+        // If ANDROID client gets 400, fall back to iOS client
         if (resp as? HTTPURLResponse)?.statusCode == 400 {
             var req2 = URLRequest(url: playerURL)
             req2.httpMethod = "POST"
             req2.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req2.setValue("com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+                          forHTTPHeaderField: "User-Agent")
             req2.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
             req2.timeoutInterval = 30
             for (k, v) in authHeaders { req2.setValue(v, forHTTPHeaderField: k) }
@@ -284,8 +283,9 @@ class DownloadManager: ObservableObject {
                 "videoId": videoId,
                 "context": [
                     "client": [
-                        "clientName":    "WEB",
-                        "clientVersion": "2.20231121.08.00",
+                        "clientName":    "IOS",
+                        "clientVersion": "19.29.1",
+                        "deviceModel":   "iPhone16,2",
                         "hl": "en", "gl": "US",
                     ]
                 ]
@@ -295,7 +295,7 @@ class DownloadManager: ObservableObject {
 
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
             if !AuthManager.shared.isSignedIn {
-                throw ytErr("Sign in to your Google account in Settings to download")
+                throw ytErr("Sign in to your Google account to download")
             }
             throw ytErr("Server returned \((resp as? HTTPURLResponse)?.statusCode ?? 0)")
         }
